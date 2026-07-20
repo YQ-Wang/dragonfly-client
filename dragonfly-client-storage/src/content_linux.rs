@@ -26,7 +26,7 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{
     self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter, SeekFrom,
 };
-use tokio_util::io::InspectReader;
+use tokio_util::io::InspectWriter;
 use tracing::{debug, error, info, instrument, warn};
 use walkdir::WalkDir;
 
@@ -314,23 +314,27 @@ impl Content {
         })?;
 
         let reader = reader.take(expected_length);
-        let reader = BufReader::with_capacity(self.config.storage.write_buffer_size, reader);
-        let mut writer = BufWriter::with_capacity(self.config.storage.write_buffer_size, f);
+        let mut reader = BufReader::with_capacity(self.config.storage.write_buffer_size, reader);
+        let writer = BufWriter::with_capacity(self.config.storage.write_buffer_size, f);
 
-        // Copy the piece to the file while updating the CRC32 value.
+        // copy_buf writes directly from the large BufReader window instead of copying through
+        // io::copy's additional small buffer. Inspect accepted writes to preserve CRC semantics.
         let mut hasher = crc32fast::Hasher::new();
-        let mut tee = InspectReader::new(reader, |bytes| {
+        let mut tee = InspectWriter::new(writer, |bytes| {
             hasher.update(bytes);
         });
 
         debug!("start to write piece to {:?}", task_path);
-        let length = io::copy(&mut tee, &mut writer).await.inspect_err(|err| {
-            error!("copy {:?} failed: {}", task_path, err);
-        })?;
+        let length = io::copy_buf(&mut reader, &mut tee)
+            .await
+            .inspect_err(|err| {
+                error!("copy {:?} failed: {}", task_path, err);
+            })?;
 
-        writer.flush().await.inspect_err(|err| {
+        tee.flush().await.inspect_err(|err| {
             error!("flush {:?} failed: {}", task_path, err);
         })?;
+        drop(tee);
         debug!("finish to write piece to {:?}", task_path);
 
         if length != expected_length {
@@ -541,23 +545,26 @@ impl Content {
         })?;
 
         let reader = reader.take(expected_length);
-        let reader = BufReader::with_capacity(self.config.storage.write_buffer_size, reader);
-        let mut writer = BufWriter::with_capacity(self.config.storage.write_buffer_size, f);
+        let mut reader = BufReader::with_capacity(self.config.storage.write_buffer_size, reader);
+        let writer = BufWriter::with_capacity(self.config.storage.write_buffer_size, f);
 
         // Copy the piece to the file while updating the CRC32 value.
         let mut hasher = crc32fast::Hasher::new();
-        let mut tee = InspectReader::new(reader, |bytes| {
+        let mut tee = InspectWriter::new(writer, |bytes| {
             hasher.update(bytes);
         });
 
         debug!("start to write piece to {:?}", task_path);
-        let length = io::copy(&mut tee, &mut writer).await.inspect_err(|err| {
-            error!("copy {:?} failed: {}", task_path, err);
-        })?;
+        let length = io::copy_buf(&mut reader, &mut tee)
+            .await
+            .inspect_err(|err| {
+                error!("copy {:?} failed: {}", task_path, err);
+            })?;
 
-        writer.flush().await.inspect_err(|err| {
+        tee.flush().await.inspect_err(|err| {
             error!("flush {:?} failed: {}", task_path, err);
         })?;
+        drop(tee);
         debug!("finish to write piece to {:?}", task_path);
 
         if length != expected_length {
@@ -787,23 +794,26 @@ impl Content {
         })?;
 
         let reader = reader.take(expected_length);
-        let reader = BufReader::with_capacity(self.config.storage.write_buffer_size, reader);
-        let mut writer = BufWriter::with_capacity(self.config.storage.write_buffer_size, f);
+        let mut reader = BufReader::with_capacity(self.config.storage.write_buffer_size, reader);
+        let writer = BufWriter::with_capacity(self.config.storage.write_buffer_size, f);
 
         // Copy the piece to the file while updating the CRC32 value.
         let mut hasher = crc32fast::Hasher::new();
-        let mut tee = InspectReader::new(reader, |bytes| {
+        let mut tee = InspectWriter::new(writer, |bytes| {
             hasher.update(bytes);
         });
 
         debug!("start to write piece to {:?}", task_path);
-        let length = io::copy(&mut tee, &mut writer).await.inspect_err(|err| {
-            error!("copy {:?} failed: {}", task_path, err);
-        })?;
+        let length = io::copy_buf(&mut reader, &mut tee)
+            .await
+            .inspect_err(|err| {
+                error!("copy {:?} failed: {}", task_path, err);
+            })?;
 
-        writer.flush().await.inspect_err(|err| {
+        tee.flush().await.inspect_err(|err| {
             error!("flush {:?} failed: {}", task_path, err);
         })?;
+        drop(tee);
         debug!("finish to write piece to {:?}", task_path);
 
         if length != expected_length {

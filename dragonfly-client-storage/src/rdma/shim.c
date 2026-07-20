@@ -27,8 +27,8 @@
  * tagged messaging. This is the only verbs surface common to AWS EFA (SRD) and RoCE/
  * InfiniBand (via verbs;ofi_rxm), and it never exposes remote-access memory keys.
  *
- * Thread safety: callers must serialize all calls on one dfrdma_fabric handle. The Rust
- * wrapper enforces this with a mutex, so FI_THREAD_DOMAIN-level providers are also safe.
+ * Thread safety: the Rust wrapper posts operations concurrently with CQ progress, so only
+ * providers that grant FI_THREAD_SAFE are accepted.
  */
 
 #include <stdint.h>
@@ -49,6 +49,15 @@
 #ifndef FI_CONTEXT2
 #define FI_CONTEXT2 (0ULL)
 #endif
+
+#define DFRDMA_CQ_BATCH_MAX 32
+
+typedef struct dfrdma_completion {
+    void *context;
+    uint64_t flags;
+    size_t len;
+    int64_t err;
+} dfrdma_completion;
 
 typedef struct dfrdma_fabric {
     struct fi_info *info;
@@ -87,6 +96,34 @@ void dfrdma_close(dfrdma_fabric *f)
 }
 
 /*
+ * Prefers a non-efa-direct fi_info entry. Raw `fi_info -p efa` often lists efa-direct
+ * first; that fabric is MTU-limited and is not a drop-in for Dragonfly's multi-MiB pieces.
+ * Tagged-messaging hints usually filter it already; this walk is defense in depth.
+ * Returns a duplicated info that the caller owns; frees the original list.
+ */
+static struct fi_info *dfrdma_select_info(struct fi_info *info)
+{
+    struct fi_info *it;
+    struct fi_info *selected = NULL;
+
+    for (it = info; it != NULL; it = it->next) {
+        const char *fabric_name =
+            (it->fabric_attr != NULL && it->fabric_attr->name != NULL) ? it->fabric_attr->name
+                                                                      : "";
+        if (strcmp(fabric_name, "efa-direct") == 0) {
+            continue;
+        }
+        selected = fi_dupinfo(it);
+        break;
+    }
+    if (selected == NULL && info != NULL) {
+        selected = fi_dupinfo(info);
+    }
+    fi_freeinfo(info);
+    return selected;
+}
+
+/*
  * Opens a reliable-datagram endpoint on the requested provider ("efa", "verbs", "tcp", ...)
  * or on the best provider libfabric can find when prov_name is NULL. Returns 0 on success
  * or a negative fi_errno value.
@@ -94,6 +131,7 @@ void dfrdma_close(dfrdma_fabric *f)
 int dfrdma_open(const char *prov_name, const char *domain_name, dfrdma_fabric **out)
 {
     struct fi_info *hints = NULL;
+    struct fi_info *info = NULL;
     dfrdma_fabric *f = NULL;
     struct fi_av_attr av_attr;
     struct fi_cq_attr cq_attr;
@@ -126,9 +164,20 @@ int dfrdma_open(const char *prov_name, const char *domain_name, dfrdma_fabric **
         hints->domain_attr->name = strdup(domain_name);
     }
 
-    rc = fi_getinfo(DFRDMA_API_VERSION, NULL, NULL, 0, hints, &f->info);
+    rc = fi_getinfo(DFRDMA_API_VERSION, NULL, NULL, 0, hints, &info);
     fi_freeinfo(hints);
     if (rc != 0) {
+        goto fail;
+    }
+
+    f->info = dfrdma_select_info(info);
+    if (f->info == NULL) {
+        rc = -FI_ENODATA;
+        goto fail;
+    }
+    if (f->info->domain_attr == NULL ||
+        f->info->domain_attr->threading != FI_THREAD_SAFE) {
+        rc = -FI_ENODATA;
         goto fail;
     }
 
@@ -290,28 +339,30 @@ int64_t dfrdma_tsend(dfrdma_fabric *f, const void *buf, size_t len, void *desc,
 }
 
 /*
- * Reads one completion. Returns 1 when a completion (success or error) was written to the
- * output parameters, 0 when the queue is empty, and a negative fi_errno value on a fatal
- * queue error. For error completions, err is a positive fi_errno value.
+ * Reads up to capacity completions. Returns the number of success/error completions written,
+ * 0 when the queue is empty, or a negative fi_errno value on a fatal queue error. Error
+ * completions are read one at a time because libfabric exposes them through fi_cq_readerr.
  */
-int dfrdma_cq_read(dfrdma_fabric *f, void **context, uint64_t *flags, size_t *len,
-                   int64_t *err)
+int dfrdma_cq_read_batch(dfrdma_fabric *f, dfrdma_completion *out, size_t capacity)
 {
-    struct fi_cq_msg_entry entry;
+    struct fi_cq_msg_entry entries[DFRDMA_CQ_BATCH_MAX];
     struct fi_cq_err_entry err_entry;
     ssize_t rc;
+    size_t i;
 
-    *context = NULL;
-    *flags = 0;
-    *len = 0;
-    *err = 0;
+    if (out == NULL || capacity == 0 || capacity > DFRDMA_CQ_BATCH_MAX) {
+        return -FI_EINVAL;
+    }
 
-    rc = fi_cq_read(f->cq, &entry, 1);
-    if (rc == 1) {
-        *context = entry.op_context;
-        *flags = entry.flags;
-        *len = entry.len;
-        return 1;
+    rc = fi_cq_read(f->cq, entries, capacity);
+    if (rc > 0) {
+        for (i = 0; i < (size_t)rc; i++) {
+            out[i].context = entries[i].op_context;
+            out[i].flags = entries[i].flags;
+            out[i].len = entries[i].len;
+            out[i].err = 0;
+        }
+        return (int)rc;
     }
     if (rc == -FI_EAGAIN) {
         return 0;
@@ -320,10 +371,10 @@ int dfrdma_cq_read(dfrdma_fabric *f, void **context, uint64_t *flags, size_t *le
         memset(&err_entry, 0, sizeof(err_entry));
         rc = fi_cq_readerr(f->cq, &err_entry, 0);
         if (rc == 1) {
-            *context = err_entry.op_context;
-            *flags = err_entry.flags;
-            *len = err_entry.len;
-            *err = err_entry.err != 0 ? (int64_t)err_entry.err : (int64_t)FI_EIO;
+            out[0].context = err_entry.op_context;
+            out[0].flags = err_entry.flags;
+            out[0].len = err_entry.len;
+            out[0].err = err_entry.err != 0 ? (int64_t)err_entry.err : (int64_t)FI_EIO;
             return 1;
         }
         return rc < 0 ? (int)rc : -FI_EIO;

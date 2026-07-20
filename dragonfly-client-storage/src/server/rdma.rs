@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::client::rdma::{DEFAULT_CHUNK_SIZE, MAX_CHUNKS};
+use crate::client::rdma::MAX_CHUNKS;
 use crate::rdma::fabric::Fabric;
 use crate::rdma::rendezvous::{
     read_frame, write_frame, CapabilityRegistry, Frame, PieceKind, PieceReady, PieceRequest,
@@ -160,6 +160,7 @@ impl RDMAServer {
                 fabric_tag: fabric_tag.to_string(),
             },
             fabric,
+            chunk_size: rdma_config.chunk_size.as_u64(),
             transfer_timeout: rdma_config.transfer_timeout,
         };
         let handler = Arc::new(handler);
@@ -235,6 +236,9 @@ struct RDMAServerHandler {
 
     /// fabric is the shared libfabric endpoint.
     fabric: Arc<Fabric>,
+
+    /// chunk_size is the server's preferred maximum tagged-message size.
+    chunk_size: u64,
 
     /// transfer_timeout bounds each fabric operation and rendezvous wait.
     transfer_timeout: std::time::Duration,
@@ -326,7 +330,7 @@ impl RDMAServerHandler {
 
         let chunk_size = request
             .chunk_size
-            .min(DEFAULT_CHUNK_SIZE)
+            .min(self.chunk_size)
             .min(self.fabric.max_msg_size() as u64);
         if piece.length == 0 || chunk_size == 0 {
             self.abort(
@@ -354,7 +358,7 @@ impl RDMAServerHandler {
             .await;
 
         // Load the piece content into a pinned send buffer.
-        let buf = match self.fabric.alloc_buffer(piece.length as usize).await {
+        let mut buf = match self.fabric.acquire_buffer(piece.length as usize).await {
             Ok(buf) => buf,
             Err(err) => {
                 self.abort(writer, ERROR_CODE_TOO_LARGE, err.to_string())
@@ -430,6 +434,7 @@ impl RDMAServerHandler {
             Err(err) => return Err(err),
         }
 
+        // The pooled lease remains alive until every send completion is reaped.
         let mut ops = Vec::with_capacity(chunk_count as usize);
         for chunk in 0..chunk_count {
             let offset = chunk * chunk_size;
@@ -437,7 +442,7 @@ impl RDMAServerHandler {
             ops.push(
                 self.fabric
                     .post_send(
-                        &buf,
+                        buf.buffer(),
                         offset as usize,
                         len as usize,
                         request.tag.wrapping_add(chunk),

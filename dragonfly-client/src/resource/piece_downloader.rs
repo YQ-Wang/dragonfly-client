@@ -492,12 +492,6 @@ pub mod rdma {
             }
 
             let rdma_config = &self.config.storage.server.rdma;
-            if !rdma_config.enable {
-                *state = FabricState::Failed(Instant::now());
-                return Err(Error::Unsupported(
-                    "rdma is disabled in local configuration".to_string(),
-                ));
-            }
             let Some(fabric_tag) = rdma_config
                 .fabric_tag
                 .as_deref()
@@ -683,6 +677,25 @@ pub mod rdma {
                     Err(err)
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn receive_only_config_can_initialize_downloader_fabric() {
+            let mut config = Config::default();
+            config.download.protocol = "rdma".to_string();
+            config.storage.server.rdma.enable = false;
+            config.storage.server.rdma.allow_software_provider = true;
+            config.storage.server.rdma.fabric_tag = Some("test-fabric".to_string());
+
+            let downloader = RDMADownloader::new(Arc::new(config));
+            let (_, capability) = downloader.fabric().await.unwrap();
+
+            assert_eq!(capability.fabric_tag, "test-fabric");
         }
     }
 }

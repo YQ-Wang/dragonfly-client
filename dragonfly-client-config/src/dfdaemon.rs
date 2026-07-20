@@ -265,12 +265,18 @@ fn default_storage_server_rdma_provider() -> RdmaProvider {
     RdmaProvider::Auto
 }
 
-/// default_storage_server_rdma_max_registered_bytes bounds memory pinned for in-flight RDMA
-/// transfers. The transport may use less than this value when the platform's memlock limit is
-/// lower.
+/// default_storage_server_rdma_max_registered_bytes bounds memory pinned for active and cached
+/// RDMA transfer buffers. The transport may use less when the platform's memlock limit is lower.
 #[inline]
 fn default_storage_server_rdma_max_registered_bytes() -> ByteSize {
     ByteSize::mib(512)
+}
+
+/// default_storage_server_rdma_chunk_size is the preferred size of one tagged fabric message.
+/// The peers negotiate the lower configured value and provider maximum.
+#[inline]
+fn default_storage_server_rdma_chunk_size() -> ByteSize {
+    ByteSize::mib(4)
 }
 
 /// default_storage_server_rdma_transfer_timeout is the maximum time an RDMA operation may remain
@@ -1001,12 +1007,14 @@ impl fmt::Display for RdmaProvider {
     }
 }
 
-/// RdmaServer configures the optional Linux/libfabric bulk-piece transport. The TCP storage
-/// server remains required for rendezvous and per-piece fallback.
+/// RdmaServer configures the optional Linux/libfabric bulk-piece transport. Settings other than
+/// `enable` are also used by an RDMA downloader; `enable` controls only whether this daemon serves
+/// pieces over RDMA. The TCP storage server remains required for discovery and per-piece fallback.
 #[derive(Debug, Clone, Validate, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RdmaServer {
-    /// Enable the RDMA storage server and allow the downloader to prefer compatible RDMA peers.
+    /// Enable serving pieces over RDMA. Downloading is selected independently with
+    /// `download.protocol: rdma`.
     pub enable: bool,
 
     /// TCP port used for reliable rendezvous, capability exchange, metadata, and errors. Bulk
@@ -1033,12 +1041,20 @@ pub struct RdmaServer {
     #[validate(length(min = 1))]
     pub fabric_tag: Option<String>,
 
-    /// Upper bound on bytes pinned or registered by the transport for in-flight operations.
+    /// Upper bound on bytes pinned or registered by active and idle pooled transfer buffers.
     #[serde(
         with = "bytesize_serde",
         default = "default_storage_server_rdma_max_registered_bytes"
     )]
     pub max_registered_bytes: ByteSize,
+
+    /// Preferred size of one tagged fabric message. Larger values reduce posting and completion
+    /// overhead, while smaller values improve fairness between concurrent transfers.
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_storage_server_rdma_chunk_size"
+    )]
+    pub chunk_size: ByteSize,
 
     /// Maximum duration of one fabric operation before cancellation and TCP fallback.
     #[serde(
@@ -1059,6 +1075,7 @@ impl Default for RdmaServer {
             device: None,
             fabric_tag: None,
             max_registered_bytes: default_storage_server_rdma_max_registered_bytes(),
+            chunk_size: default_storage_server_rdma_chunk_size(),
             transfer_timeout: default_storage_server_rdma_transfer_timeout(),
         }
     }
@@ -2238,6 +2255,7 @@ key: /etc/ssl/private/client.pem
                     "device": "efa_0-rdm",
                     "fabricTag": "vpc-123/use1-az1",
                     "maxRegisteredBytes": "1GiB",
+                    "chunkSize": "16MiB",
                     "transferTimeout": "15s"
                 }
             },
@@ -2266,6 +2284,7 @@ key: /etc/ssl/private/client.pem
             Some("vpc-123/use1-az1")
         );
         assert_eq!(storage.server.rdma.max_registered_bytes, ByteSize::gib(1));
+        assert_eq!(storage.server.rdma.chunk_size, ByteSize::mib(16));
         assert_eq!(
             storage.server.rdma.transfer_timeout,
             Duration::from_secs(15)
@@ -2288,6 +2307,7 @@ key: /etc/ssl/private/client.pem
         assert!(rdma.device.is_none());
         assert!(rdma.fabric_tag.is_none());
         assert_eq!(rdma.max_registered_bytes, ByteSize::mib(512));
+        assert_eq!(rdma.chunk_size, ByteSize::mib(4));
         assert_eq!(rdma.transfer_timeout, Duration::from_secs(10));
     }
 

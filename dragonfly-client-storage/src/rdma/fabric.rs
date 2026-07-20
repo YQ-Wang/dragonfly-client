@@ -20,8 +20,9 @@
 //! unique tags; per-operation completions are routed by a single progress thread that polls
 //! the completion queue.
 //!
-//! Threading model: every shim call is serialized by `FabricInner::call_lock`, which makes
-//! the wrapper safe regardless of the threading level the provider grants.
+//! Threading model: the shim requires providers to grant `FI_THREAD_SAFE`, allowing posts,
+//! memory registration, and CQ progress to run concurrently. Cancellation and CQ reads retain
+//! a narrow lock solely to protect the operation-context lifetime race between those paths.
 //!
 //! Buffer lifetime invariant: the NIC may DMA into a posted buffer until the completion
 //! (success, error, or FI_ECANCELED after fi_cancel) is reaped. Every posted operation
@@ -33,11 +34,16 @@ use dragonfly_client_core::{Error, Result};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::fmt;
 use std::hash::{BuildHasher, Hasher, RandomState};
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::{error, info, warn};
 
 /// ffi declares the C ABI exported by shim.c.
@@ -48,6 +54,16 @@ mod ffi {
     #[repr(C)]
     pub struct DfrdmaFabric {
         _private: [u8; 0],
+    }
+
+    /// DfrdmaCompletion mirrors the batched CQ result structure in shim.c.
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    pub struct DfrdmaCompletion {
+        pub context: *mut c_void,
+        pub flags: u64,
+        pub len: usize,
+        pub err: i64,
     }
 
     extern "C" {
@@ -93,12 +109,10 @@ mod ffi {
             tag: u64,
             context: *mut c_void,
         ) -> i64;
-        pub fn dfrdma_cq_read(
+        pub fn dfrdma_cq_read_batch(
             f: *mut DfrdmaFabric,
-            context: *mut *mut c_void,
-            flags: *mut u64,
-            len: *mut usize,
-            err: *mut i64,
+            out: *mut DfrdmaCompletion,
+            capacity: usize,
         ) -> c_int;
         pub fn dfrdma_cancel(f: *mut DfrdmaFabric, context: *mut c_void) -> c_int;
     }
@@ -116,6 +130,15 @@ const POST_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// PROGRESS_IDLE_INTERVAL is the sleep between completion-queue polls when idle.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
+
+/// PROGRESS_ACTIVE_INTERVAL bounds CPU use after a burst of active-operation yields.
+const PROGRESS_ACTIVE_INTERVAL: Duration = Duration::from_micros(10);
+
+/// PROGRESS_ACTIVE_YIELDS is the number of scheduler yields before a short active sleep.
+const PROGRESS_ACTIVE_YIELDS: u32 = 64;
+
+/// CQ_BATCH_SIZE amortizes the FFI, cancellation lock, and pending-map lock across completions.
+const CQ_BATCH_SIZE: usize = 32;
 
 /// CANCEL_GRACE_TIMEOUT is how long a timed-out operation waits for its cancellation
 /// completion before its buffer is intentionally leaked.
@@ -171,7 +194,8 @@ struct PendingOp {
 /// Handle owns the raw fabric pointer and closes it on drop.
 struct Handle(*mut ffi::DfrdmaFabric);
 
-/// Safety: the handle is only used under FabricInner::call_lock.
+/// Safety: the shim rejects providers that do not grant FI_THREAD_SAFE, and the handle is
+/// closed only after the progress thread exits.
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 
@@ -186,10 +210,12 @@ impl Drop for Handle {
 
 /// FabricInner is shared by the fabric API, the progress thread, and pinned buffers.
 struct FabricInner {
-    /// call_lock serializes every shim call on the handle.
-    call_lock: Mutex<()>,
+    /// cancel_progress_lock serializes cancellation with completion reaping so a context
+    /// cannot be freed between the pending-map check and fi_cancel. Hot-path posts do not
+    /// take this lock.
+    cancel_progress_lock: Mutex<()>,
 
-    /// handle is the raw fabric handle; declared after call_lock but dropped last among
+    /// handle is the raw fabric handle; declared after cancel_progress_lock but dropped first among
     /// users because buffers and the progress thread hold Arcs to this struct.
     handle: Handle,
 
@@ -212,18 +238,18 @@ impl FabricInner {
         if mr.is_null() {
             return;
         }
-        let _guard = self.call_lock.lock().unwrap();
         // Safety: mr came from dfrdma_mr_reg on this handle and is closed exactly once.
+        // The negotiated FI_THREAD_SAFE contract permits concurrent calls on the domain.
         let rc = unsafe { ffi::dfrdma_mr_close(mr) };
         if rc != 0 {
             warn!("failed to close rdma memory region: {}", rc);
         }
     }
 
-    /// cancel_ctx attempts to cancel an operation that is still tracked. The call lock is taken
-    /// before inspecting pending to preserve the same lock order as completion progress.
+    /// cancel_ctx attempts to cancel an operation that is still tracked. CQ progress cannot
+    /// remove and free the context between this lookup and fi_cancel.
     fn cancel_ctx(&self, ctx_addr: usize) {
-        let _call_guard = self.call_lock.lock().unwrap();
+        let _progress_guard = self.cancel_progress_lock.lock().unwrap();
         if !self.pending.lock().unwrap().contains_key(&ctx_addr) {
             return;
         }
@@ -248,7 +274,7 @@ struct MrGuard {
     inner: Arc<FabricInner>,
 }
 
-/// Safety: the raw handle is only used under the fabric call lock.
+/// Safety: the owning fabric requires FI_THREAD_SAFE and closes the registration before freeing it.
 unsafe impl Send for MrGuard {}
 unsafe impl Sync for MrGuard {}
 
@@ -335,6 +361,206 @@ impl PinnedBuf {
     }
 }
 
+/// BufferPoolStats is a snapshot of registered-buffer cache activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferPoolStats {
+    /// hits is the number of checkouts served by an existing registration.
+    pub hits: u64,
+
+    /// misses is the number of checkouts that allocated and registered a new buffer.
+    pub misses: u64,
+
+    /// cached_buffers is the number of idle registered buffers.
+    pub cached_buffers: usize,
+
+    /// cached_bytes is the total capacity of idle registered buffers.
+    pub cached_bytes: usize,
+}
+
+/// BufferPool retains completed registered buffers for best-fit reuse. Cached buffers keep
+/// their semaphore permits, so active plus idle memory remains bounded by the fabric budget.
+struct BufferPool {
+    /// idle contains buffers with no in-flight operation or reader.
+    idle: Mutex<Vec<Arc<PinnedBuf>>>,
+
+    /// changed wakes checkouts when a buffer is returned to the idle set.
+    changed: Notify,
+
+    /// closed prevents buffers from being retained after Fabric shutdown.
+    closed: AtomicBool,
+
+    /// hits counts successful idle-buffer reuse.
+    hits: AtomicU64,
+
+    /// misses counts new allocations and registrations.
+    misses: AtomicU64,
+}
+
+impl BufferPool {
+    /// new creates an empty registered-buffer pool.
+    fn new() -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            changed: Notify::new(),
+            closed: AtomicBool::new(false),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// take_best_fit removes the smallest idle buffer that can contain `len`. If none fits,
+    /// all undersized buffers are evicted so their permits can satisfy a larger allocation.
+    fn take_best_fit(&self, len: usize) -> Option<Arc<PinnedBuf>> {
+        let evicted = {
+            let mut idle = self.idle.lock().unwrap();
+            let best = idle
+                .iter()
+                .enumerate()
+                .filter(|(_, buf)| buf.len() >= len)
+                .min_by_key(|(_, buf)| buf.len())
+                .map(|(index, _)| index);
+            if let Some(index) = best {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(idle.swap_remove(index));
+            }
+            std::mem::take(&mut *idle)
+        };
+        drop(evicted);
+        None
+    }
+
+    /// recycle retains a completed buffer when this lease owns its only Arc.
+    fn recycle(&self, buf: Arc<PinnedBuf>) {
+        if self.closed.load(Ordering::Acquire) || Arc::strong_count(&buf) != 1 {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        idle.push(buf);
+        drop(idle);
+        self.changed.notify_one();
+    }
+
+    /// close stops future retention and releases every idle registration.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+        self.idle.lock().unwrap().clear();
+    }
+
+    /// stats returns a consistent-enough diagnostic snapshot.
+    fn stats(&self) -> BufferPoolStats {
+        let idle = self.idle.lock().unwrap();
+        BufferPoolStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            cached_buffers: idle.len(),
+            cached_bytes: idle.iter().map(|buf| buf.len()).sum(),
+        }
+    }
+}
+
+/// PooledBuf is an exclusive lease over a registered buffer. Dropping the lease returns the
+/// buffer to its pool only after every operation-owned Arc has been reaped.
+pub struct PooledBuf {
+    /// buf is taken by Drop and recycled when it has no other owners.
+    buf: Option<Arc<PinnedBuf>>,
+
+    /// pool receives the completed buffer.
+    pool: Arc<BufferPool>,
+
+    /// logical_len is the transfer-visible prefix of the physical buffer.
+    logical_len: usize,
+}
+
+impl PooledBuf {
+    /// buffer returns the registered allocation for fabric post calls.
+    pub(crate) fn buffer(&self) -> &Arc<PinnedBuf> {
+        self.buf.as_ref().expect("pooled buffer")
+    }
+
+    /// len returns the transfer-visible length.
+    pub fn len(&self) -> usize {
+        self.logical_len
+    }
+
+    /// is_empty returns whether the transfer-visible range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.logical_len == 0
+    }
+
+    /// as_mut_slice exposes only the transfer-visible prefix.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no operation over this buffer is currently posted.
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer().as_mut_slice()[..self.logical_len]
+    }
+
+    /// into_reader turns a completed receive lease into an async reader without moving or
+    /// copying its registered allocation.
+    pub fn into_reader(self) -> PooledBufReader {
+        PooledBufReader {
+            buffer: self,
+            position: 0,
+        }
+    }
+}
+
+impl Drop for PooledBuf {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.recycle(buf);
+        }
+    }
+}
+
+/// PooledBufReader reads a completed receive directly from registered memory. Its lease returns
+/// the registration to the pool when the reader is consumed or dropped.
+pub struct PooledBufReader {
+    /// buffer owns the registered-memory lease.
+    buffer: PooledBuf,
+
+    /// position is the next byte exposed to the downstream storage writer.
+    position: usize,
+}
+
+impl fmt::Debug for PooledBufReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PooledBufReader")
+            .field("length", &self.buffer.len())
+            .field("position", &self.position)
+            .finish()
+    }
+}
+
+impl AsyncRead for PooledBufReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let remaining = self.buffer.len().saturating_sub(self.position);
+        if remaining == 0 || output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let read_len = remaining.min(output.remaining());
+        let start = self.position;
+        let end = start + read_len;
+        // Safety: PooledBufReader is constructed only after every receive completion was
+        // reaped, and it exclusively owns the lease while exposing this range.
+        let content = unsafe { &self.buffer.as_mut_slice()[start..end] };
+        output.put_slice(content);
+        self.position = end;
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// OpHandle is a posted operation whose completion can be awaited exactly once.
 pub struct OpHandle {
     /// ctx_addr identifies the operation in the pending map (and to fi_cancel).
@@ -367,8 +593,9 @@ impl Drop for OpHandle {
     }
 }
 
-/// Fabric wraps one shared libfabric RDM endpoint. Create one per process and share it
-/// across transfers; endpoints are heavyweight (especially on EFA).
+/// Fabric wraps one shared libfabric RDM endpoint. Share an instance across transfers for one
+/// transport role; the downloader and server currently create separate instances. Endpoints are
+/// heavyweight, especially on EFA.
 pub struct Fabric {
     /// inner is shared with the progress thread and pinned buffers.
     inner: Arc<FabricInner>,
@@ -392,6 +619,9 @@ pub struct Fabric {
 
     /// budget_permits is the total number of permits in the budget.
     budget_permits: u32,
+
+    /// pool retains idle registrations for best-fit reuse.
+    pool: Arc<BufferPool>,
 
     /// tag_counter feeds unique transfer tags.
     tag_counter: AtomicU64,
@@ -486,7 +716,7 @@ impl Fabric {
             .min(u32::MAX as u64) as u32;
 
         let inner = Arc::new(FabricInner {
-            call_lock: Mutex::new(()),
+            cancel_progress_lock: Mutex::new(()),
             handle: Handle(handle),
             pending: Mutex::new(HashMap::new()),
             av: Mutex::new(HashMap::new()),
@@ -516,6 +746,7 @@ impl Fabric {
             max_msg_size,
             budget: Arc::new(Semaphore::new(budget_permits as usize)),
             budget_permits,
+            pool: Arc::new(BufferPool::new()),
             tag_counter: AtomicU64::new(0),
             tag_hasher: RandomState::new(),
         })
@@ -536,8 +767,14 @@ impl Fabric {
         self.max_msg_size
     }
 
-    /// next_tag returns a fresh transfer tag. Tags are randomized so concurrent transfers
-    /// on the shared endpoint cannot cross-talk.
+    /// buffer_pool_stats returns registered-buffer reuse and idle-memory counters.
+    pub fn buffer_pool_stats(&self) -> BufferPoolStats {
+        self.pool.stats()
+    }
+
+    /// next_tag derives a pseudo-random transfer base tag from a process-local counter and
+    /// randomized hash seed. Each chunk uses a consecutive tag from this base; collisions are
+    /// improbable rather than mathematically impossible.
     pub fn next_tag(&self) -> u64 {
         let counter = self.tag_counter.fetch_add(1, Ordering::Relaxed);
         let mut hasher = self.tag_hasher.build_hasher();
@@ -546,8 +783,82 @@ impl Fabric {
     }
 
     /// alloc_buffer allocates a transfer buffer of `len` bytes, waits for registered-memory
-    /// budget, and registers the buffer when the provider requires it.
+    /// budget, and registers the buffer when the provider requires it. Production transfers
+    /// should use [`Fabric::acquire_buffer`] so the registration is returned to the pool.
     pub async fn alloc_buffer(&self, len: usize) -> Result<Arc<PinnedBuf>> {
+        let mut pooled = self.acquire_buffer(len).await?;
+        Ok(pooled.buf.take().expect("pooled buffer"))
+    }
+
+    /// acquire_buffer checks out a best-fit registered buffer. It waits for either a returned
+    /// registration or fresh budget, evicting undersized idle buffers to avoid permit starvation.
+    pub async fn acquire_buffer(&self, len: usize) -> Result<PooledBuf> {
+        if len == 0 {
+            return Err(Error::InvalidParameter);
+        }
+        let permits = self.buffer_permits(len)?;
+
+        loop {
+            if self.pool.closed.load(Ordering::Acquire) {
+                return Err(Error::Unknown("rdma fabric is shut down".to_string()));
+            }
+
+            let changed = self.pool.changed.notified();
+            if let Some(buf) = self.pool.take_best_fit(len) {
+                return Ok(PooledBuf {
+                    buf: Some(buf),
+                    pool: self.pool.clone(),
+                    logical_len: len,
+                });
+            }
+
+            match self.budget.clone().try_acquire_many_owned(permits) {
+                Ok(permit) => {
+                    let buf = self.register_buffer(len, permit)?;
+                    self.pool.misses.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PooledBuf {
+                        buf: Some(buf),
+                        pool: self.pool.clone(),
+                        logical_len: len,
+                    });
+                }
+                Err(TryAcquireError::Closed) => {
+                    return Err(Error::Unknown("rdma fabric is shut down".to_string()));
+                }
+                Err(TryAcquireError::NoPermits) => {}
+            }
+
+            let budget = self.budget.clone();
+            tokio::select! {
+                _ = changed => continue,
+                permit = budget.acquire_many_owned(permits) => {
+                    let permit = permit.map_err(|_| {
+                        Error::Unknown("rdma fabric is shut down".to_string())
+                    })?;
+                    // A suitable registration may have arrived in parallel with the
+                    // semaphore grant. Prefer it and return the redundant permits.
+                    if let Some(buf) = self.pool.take_best_fit(len) {
+                        drop(permit);
+                        return Ok(PooledBuf {
+                            buf: Some(buf),
+                            pool: self.pool.clone(),
+                            logical_len: len,
+                        });
+                    }
+                    let buf = self.register_buffer(len, permit)?;
+                    self.pool.misses.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PooledBuf {
+                        buf: Some(buf),
+                        pool: self.pool.clone(),
+                        logical_len: len,
+                    });
+                }
+            }
+        }
+    }
+
+    /// buffer_permits validates a requested buffer and returns its budget units.
+    fn buffer_permits(&self, len: usize) -> Result<u32> {
         let permits = len.div_ceil(BUDGET_UNIT as usize).max(1);
         if permits > self.budget_permits as usize {
             return Err(Error::Unknown(format!(
@@ -555,41 +866,36 @@ impl Fabric {
                 len
             )));
         }
+        Ok(permits as u32)
+    }
 
-        let permit = self
-            .budget
-            .clone()
-            .acquire_many_owned(permits as u32)
-            .await
-            .map_err(|_| Error::Unknown("rdma fabric is shut down".to_string()))?;
-
+    /// register_buffer allocates stable storage and registers it using an already-owned budget.
+    fn register_buffer(&self, len: usize, permit: OwnedSemaphorePermit) -> Result<Arc<PinnedBuf>> {
         let mut data = vec![0u8; len];
         let mut mr: *mut c_void = std::ptr::null_mut();
         let mut desc: *mut c_void = std::ptr::null_mut();
-        {
-            let _guard = self.inner.call_lock.lock().unwrap();
-            // Safety: data outlives the registration; PinnedBuf's field order guarantees
-            // the MrGuard closes the registration before the Vec is freed.
-            let rc = unsafe {
-                ffi::dfrdma_mr_reg(
-                    self.inner.handle.0,
-                    data.as_mut_ptr() as *mut c_void,
-                    len,
-                    &mut mr,
-                    &mut desc,
-                )
-            };
-            if rc != 0 {
-                if self.inner.mr_required {
-                    return Err(fi_error("fi_mr_reg", rc as i64));
-                }
-                warn!(
-                    "rdma memory registration failed ({}), continuing unregistered",
-                    rc
-                );
-                mr = std::ptr::null_mut();
-                desc = std::ptr::null_mut();
+        // Safety: data outlives the registration; PinnedBuf's field order guarantees the
+        // MrGuard closes the registration before the Vec is freed. FI_THREAD_SAFE permits
+        // registration concurrently with endpoint and CQ operations.
+        let rc = unsafe {
+            ffi::dfrdma_mr_reg(
+                self.inner.handle.0,
+                data.as_mut_ptr() as *mut c_void,
+                len,
+                &mut mr,
+                &mut desc,
+            )
+        };
+        if rc != 0 {
+            if self.inner.mr_required {
+                return Err(fi_error("fi_mr_reg", rc as i64));
             }
+            warn!(
+                "rdma memory registration failed ({}), continuing unregistered",
+                rc
+            );
+            mr = std::ptr::null_mut();
+            desc = std::ptr::null_mut();
         }
 
         Ok(Arc::new(PinnedBuf {
@@ -606,32 +912,28 @@ impl Fabric {
     /// resolve inserts a peer endpoint address into the address vector, returning its
     /// fabric address. Results are cached.
     pub fn resolve(&self, endpoint: &[u8]) -> Result<u64> {
-        if let Some(addr) = self.inner.av.lock().unwrap().get(endpoint) {
+        // Hold the cache lock through insertion to avoid racing duplicate AV entries.
+        let mut av = self.inner.av.lock().unwrap();
+        if let Some(addr) = av.get(endpoint) {
             return Ok(*addr);
         }
 
         let mut addr: u64 = 0;
-        {
-            let _guard = self.inner.call_lock.lock().unwrap();
-            // Safety: endpoint bytes are valid for the call.
-            let rc = unsafe {
-                ffi::dfrdma_av_insert(
-                    self.inner.handle.0,
-                    endpoint.as_ptr(),
-                    endpoint.len(),
-                    &mut addr,
-                )
-            };
-            if rc != 0 {
-                return Err(fi_error("fi_av_insert", rc as i64));
-            }
+        // Safety: endpoint bytes are valid for the call and FI_THREAD_SAFE permits
+        // concurrent access to the address vector and endpoint.
+        let rc = unsafe {
+            ffi::dfrdma_av_insert(
+                self.inner.handle.0,
+                endpoint.as_ptr(),
+                endpoint.len(),
+                &mut addr,
+            )
+        };
+        if rc != 0 {
+            return Err(fi_error("fi_av_insert", rc as i64));
         }
 
-        self.inner
-            .av
-            .lock()
-            .unwrap()
-            .insert(endpoint.to_vec(), addr);
+        av.insert(endpoint.to_vec(), addr);
         Ok(addr)
     }
 
@@ -689,31 +991,28 @@ impl Fabric {
 
         let deadline = tokio::time::Instant::now() + POST_RETRY_TIMEOUT;
         loop {
-            let rc = {
-                let _guard = self.inner.call_lock.lock().unwrap();
-                // Safety: buf outlives the operation via the pending map; the range was
-                // validated above; ctx_addr points at the boxed context block owned by the
-                // pending map.
-                unsafe {
-                    match dest {
-                        Some(dest) => ffi::dfrdma_tsend(
-                            self.inner.handle.0,
-                            buf.ptr(offset) as *const c_void,
-                            len,
-                            buf.desc,
-                            dest,
-                            tag,
-                            ctx_addr as *mut c_void,
-                        ),
-                        None => ffi::dfrdma_trecv(
-                            self.inner.handle.0,
-                            buf.ptr(offset) as *mut c_void,
-                            len,
-                            buf.desc,
-                            tag,
-                            ctx_addr as *mut c_void,
-                        ),
-                    }
+            // Safety: buf outlives the operation via the pending map; the range was
+            // validated above; ctx_addr points at the boxed context block owned by the
+            // pending map. The shim requires FI_THREAD_SAFE, so posts may run concurrently.
+            let rc = unsafe {
+                match dest {
+                    Some(dest) => ffi::dfrdma_tsend(
+                        self.inner.handle.0,
+                        buf.ptr(offset) as *const c_void,
+                        len,
+                        buf.desc,
+                        dest,
+                        tag,
+                        ctx_addr as *mut c_void,
+                    ),
+                    None => ffi::dfrdma_trecv(
+                        self.inner.handle.0,
+                        buf.ptr(offset) as *mut c_void,
+                        len,
+                        buf.desc,
+                        tag,
+                        ctx_addr as *mut c_void,
+                    ),
                 }
             };
 
@@ -798,6 +1097,9 @@ impl Drop for Fabric {
         if let Some(progress) = self.progress.take() {
             let _ = progress.join();
         }
+        // Release idle registrations before the endpoint handle can close. Leases still held by
+        // downstream readers observe the closed pool and release their buffers on drop.
+        self.pool.close();
         // Pending operations are NOT cleared here: their buffers must stay alive until the
         // endpoint closes. FabricInner's field order (handle before pending) closes the
         // endpoint before the map releases the buffers.
@@ -808,42 +1110,61 @@ impl Drop for Fabric {
 /// the only place pending-map entries (and thus buffer references) are released on the
 /// success path.
 fn progress_loop(inner: Arc<FabricInner>) {
+    let mut active_yields = 0u32;
     while !inner.shutdown.load(Ordering::Relaxed) {
         let mut progressed = false;
         loop {
-            let mut context: *mut c_void = std::ptr::null_mut();
-            let mut flags: u64 = 0;
-            let mut len: usize = 0;
-            let mut err: i64 = 0;
+            let mut entries = [ffi::DfrdmaCompletion {
+                context: std::ptr::null_mut(),
+                flags: 0,
+                len: 0,
+                err: 0,
+            }; CQ_BATCH_SIZE];
+            let mut completed: [Option<(Completion, PendingOp)>; CQ_BATCH_SIZE] =
+                std::array::from_fn(|_| None);
             let rc = {
-                let _guard = inner.call_lock.lock().unwrap();
+                // Keep cancellation from observing these contexts until every CQ result is
+                // removed from pending. Posts and registrations remain concurrent.
+                let _guard = inner.cancel_progress_lock.lock().unwrap();
                 // Safety: the handle is valid until FabricInner drops, which cannot happen
-                // while this thread holds an Arc to it.
-                unsafe {
-                    ffi::dfrdma_cq_read(
-                        inner.handle.0,
-                        &mut context,
-                        &mut flags,
-                        &mut len,
-                        &mut err,
-                    )
+                // while this thread holds an Arc to it. FI_THREAD_SAFE permits concurrent
+                // posts on other threads; entries has the capacity passed to the shim.
+                let rc = unsafe {
+                    ffi::dfrdma_cq_read_batch(inner.handle.0, entries.as_mut_ptr(), entries.len())
+                };
+                if rc > 0 {
+                    // Batched removal under the cancellation/CQ lock closes the lifetime gap
+                    // between cancel_ctx's pending lookup and its fi_cancel call.
+                    let mut pending = inner.pending.lock().unwrap();
+                    for index in 0..rc as usize {
+                        if let Some(op) = pending.remove(&(entries[index].context as usize)) {
+                            completed[index] = Some((
+                                Completion {
+                                    len: entries[index].len,
+                                    err: entries[index].err,
+                                },
+                                op,
+                            ));
+                        }
+                    }
                 }
+                rc
             };
 
             match rc {
-                1 => {
+                count if count > 0 => {
                     progressed = true;
-                    // Remove under the lock but deliver (and drop the op, which may close a
-                    // memory region) outside it, so the pending mutex is never held while
-                    // taking the call lock.
-                    let op = inner.pending.lock().unwrap().remove(&(context as usize));
-                    match op {
-                        Some(op) => {
+                    // Deliver and drop outside both locks because dropping an operation may
+                    // close its memory region.
+                    for (index, completion) in
+                        completed.into_iter().take(count as usize).enumerate()
+                    {
+                        if let Some((completion, op)) = completion {
                             // The receiver may have timed out and gone; that is fine, the
                             // buffer reference is released either way.
-                            let _ = op.tx.send(Completion { len, err });
-                        }
-                        None => {
+                            let _ = op.tx.send(completion);
+                        } else {
+                            let _ = entries[index].flags;
                             warn!("rdma completion for unknown context, dropping");
                         }
                     }
@@ -856,8 +1177,17 @@ fn progress_loop(inner: Arc<FabricInner>) {
             }
         }
 
-        if !progressed {
+        if progressed {
+            active_yields = 0;
+        } else if inner.pending.lock().unwrap().is_empty() {
+            active_yields = 0;
             std::thread::sleep(PROGRESS_IDLE_INTERVAL);
+        } else if active_yields < PROGRESS_ACTIVE_YIELDS {
+            active_yields += 1;
+            std::thread::yield_now();
+        } else {
+            active_yields = 0;
+            std::thread::sleep(PROGRESS_ACTIVE_INTERVAL);
         }
     }
 }
@@ -973,5 +1303,104 @@ mod tests {
         let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
         assert!(fabric.alloc_buffer(2 * 1024 * 1024).await.is_err());
         assert!(fabric.alloc_buffer(512 * 1024).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pooled_buffers_reuse_the_best_fit_registration() {
+        let fabric = Fabric::new(None, None, 4 * 1024 * 1024, true).expect("libfabric endpoint");
+        let first = fabric.acquire_buffer(1024 * 1024).await.unwrap();
+        let first_ptr = Arc::as_ptr(first.buffer());
+        drop(first);
+
+        let second = fabric.acquire_buffer(512 * 1024).await.unwrap();
+        assert_eq!(Arc::as_ptr(second.buffer()), first_ptr);
+        assert_eq!(second.len(), 512 * 1024);
+        assert_eq!(second.buffer().len(), 1024 * 1024);
+
+        let stats = fabric.buffer_pool_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pooled_reader_hides_unused_capacity_and_recycles() {
+        let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
+        let mut buffer = fabric.acquire_buffer(4096).await.unwrap();
+        // Safety: this lease has not been posted.
+        unsafe { buffer.as_mut_slice() }.fill(0x5a);
+        drop(buffer);
+
+        let smaller = fabric.acquire_buffer(17).await.unwrap();
+        let mut reader = smaller.into_reader();
+        let mut content = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, vec![0x5a; 17]);
+        drop(reader);
+
+        let stats = fabric.buffer_pool_stats();
+        assert_eq!(stats.cached_buffers, 1);
+        assert_eq!(stats.cached_bytes, 4096);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pooled_waiter_reuses_returned_full_budget_buffer() {
+        let fabric =
+            Arc::new(Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint"));
+        let first = fabric.acquire_buffer(1024 * 1024).await.unwrap();
+        let first_ptr = Arc::as_ptr(first.buffer()) as usize;
+
+        let waiting_fabric = fabric.clone();
+        let waiter = tokio::spawn(async move { waiting_fabric.acquire_buffer(1024 * 1024).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("pool waiter timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(Arc::as_ptr(second.buffer()) as usize, first_ptr);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_flight_buffer_is_not_returned_to_pool() {
+        let fabric = open_fabric();
+        let buffer = fabric.acquire_buffer(4096).await.unwrap();
+        let op = fabric
+            .post_recv(buffer.buffer(), 0, 4096, fabric.next_tag())
+            .await
+            .unwrap();
+        drop(buffer);
+        assert_eq!(fabric.buffer_pool_stats().cached_buffers, 0);
+
+        drop(op);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !fabric.inner.pending.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled operation was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fabric.buffer_pool_stats().cached_buffers, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_pool_releases_idle_registered_budget() {
+        let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
+        let buffer = fabric.acquire_buffer(1024 * 1024).await.unwrap();
+        drop(buffer);
+        assert_eq!(fabric.budget.available_permits(), 0);
+        assert_eq!(fabric.buffer_pool_stats().cached_bytes, 1024 * 1024);
+
+        fabric.pool.close();
+        assert_eq!(
+            fabric.budget.available_permits(),
+            fabric.budget_permits as usize
+        );
+        assert_eq!(fabric.buffer_pool_stats().cached_buffers, 0);
     }
 }

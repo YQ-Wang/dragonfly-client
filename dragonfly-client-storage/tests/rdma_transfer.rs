@@ -15,9 +15,9 @@
  */
 
 //! End-to-end test of the RDMA piece transport: a real RDMAServer serving a piece from
-//! real storage to a real RDMAClient over libfabric. On hosts without RDMA hardware
-//! libfabric selects its tcp/sockets provider, exercising the identical code path used by
-//! the efa and verbs providers.
+//! real storage to a real RDMAClient over libfabric. On hosts without RDMA hardware,
+//! libfabric selects its tcp/sockets provider, exercising the same application and shim path as
+//! the efa and verbs providers while not reproducing hardware-provider behavior.
 
 #![cfg(feature = "rdma")]
 
@@ -198,7 +198,8 @@ async fn downloads_piece_over_rdma() {
         .unwrap(),
     );
 
-    // 10 MiB piece: three fabric chunks at the default 4 MiB chunk size.
+    // 10 MiB piece: the client requests 1 MiB chunks while the server permits the default
+    // 4 MiB, exercising lower-value negotiation across ten fabric messages.
     let task_id = "b969ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
     let content: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 249) as u8).collect();
     let digest = write_piece(&storage, task_id, 0, &content).await;
@@ -210,14 +211,28 @@ async fn downloads_piece_over_rdma() {
     let advertisement = discover(&tcp_addr, Duration::from_secs(5)).await.unwrap();
     assert_eq!(advertisement.port, config.storage.server.rdma.port);
     assert!(capability.compatible(&advertisement.capability).is_ok());
-    let client = RDMAClient::new(config.clone(), fabric, capability, addr.clone());
-    let (mut reader, offset, got_digest) = client.download_piece(0, task_id).await.unwrap();
-
-    assert_eq!(offset, 0);
-    assert_eq!(got_digest, digest);
-    let mut downloaded = Vec::new();
-    reader.read_to_end(&mut downloaded).await.unwrap();
-    assert_eq!(downloaded, content);
+    let mut client_config = config.as_ref().clone();
+    client_config.storage.server.rdma.chunk_size = bytesize::ByteSize::mib(1);
+    let client = RDMAClient::new(
+        Arc::new(client_config),
+        fabric.clone(),
+        capability,
+        addr.clone(),
+    );
+    for _ in 0..2 {
+        let (mut reader, offset, got_digest) = client.download_piece(0, task_id).await.unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(got_digest, digest);
+        let mut downloaded = Vec::new();
+        reader.read_to_end(&mut downloaded).await.unwrap();
+        assert_eq!(downloaded, content);
+        // Releasing the reader returns its completed registration to the client pool.
+        drop(reader);
+    }
+    let stats = fabric.buffer_pool_stats();
+    assert_eq!(stats.misses, 1);
+    assert_eq!(stats.hits, 1);
+    assert_eq!(stats.cached_buffers, 1);
 
     shutdown.trigger();
 }

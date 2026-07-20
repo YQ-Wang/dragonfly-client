@@ -15,7 +15,7 @@
  */
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Locates the libfabric installation and compiles the C shim for the optional `rdma`
@@ -63,10 +63,127 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=dfrdma_shim");
-    if let Some(ref lib_dir) = lib_dir {
-        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    emit_libfabric_link(lib_dir.as_deref());
+}
+
+/// Emits linker search paths and libraries for libfabric and its RDMA transitive
+/// dependencies. Amazon's libfabric needs `libefa` and `libibverbs` (often installed
+/// under `/usr` while libfabric lives in `/opt/amazon/efa/lib`); distro builds used for
+/// software-provider CI typically resolve the same DT_NEEDED entries from the system path.
+fn emit_libfabric_link(lib_dir: Option<&Path>) {
+    if let Some(dir) = lib_dir {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        // Keep runtime resolution working when libfabric lives outside the default loader
+        // path (for example `/opt/amazon/efa/lib` on AWS EFA nodes).
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
     }
     println!("cargo:rustc-link-lib=dylib=fabric");
+
+    let fabric_so = lib_dir.and_then(|dir| {
+        ["libfabric.so", "libfabric.dylib"]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.exists())
+    });
+    let needed = fabric_so
+        .as_ref()
+        .map(|path| read_needed_libs(path))
+        .unwrap_or_default();
+
+    // Always consider the Amazon EFA pair; also honor whatever else libfabric DT_NEEDED.
+    let mut deps: Vec<String> = vec!["libefa.so.1".into(), "libibverbs.so.1".into()];
+    for lib in needed {
+        if (lib.starts_with("libefa.so") || lib.starts_with("libibverbs.so"))
+            && !deps.iter().any(|d| d == &lib)
+        {
+            deps.push(lib);
+        }
+    }
+
+    for soname in deps {
+        let Some(dir) = find_library_dir(lib_dir, &soname) else {
+            continue;
+        };
+        if Some(dir.as_path()) != lib_dir {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        // Prefer the unversioned -lefa / -libverbs linker name when the development
+        // symlink exists; otherwise link the exact soname (`-l:libefa.so.1`).
+        let stem = soname
+            .trim_start_matches("lib")
+            .split(".so")
+            .next()
+            .unwrap_or("efa");
+        if library_in_dir(&dir, stem) {
+            println!("cargo:rustc-link-lib=dylib={stem}");
+        } else {
+            println!("cargo:rustc-link-arg=-l:{soname}");
+        }
+    }
+}
+
+/// Parses DT_NEEDED entries from a shared library via `readelf` (or `otool` is not needed;
+/// macOS libfabric builds do not pull Amazon EFA deps).
+fn read_needed_libs(lib: &Path) -> Vec<String> {
+    let output = Command::new("readelf").args(["-d"]).arg(lib).output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.contains("(NEEDED)") {
+                return None;
+            }
+            let start = line.find('[')?;
+            let end = line.find(']')?;
+            Some(line[start + 1..end].to_string())
+        })
+        .collect()
+}
+
+/// Returns a directory that contains `soname` (e.g. `libefa.so.1`) or an unversioned
+/// `lib{stem}.so` / `.a` / `.dylib`, preferring `preferred` when it has the library.
+fn find_library_dir(preferred: Option<&Path>, soname: &str) -> Option<PathBuf> {
+    let stem = soname
+        .trim_start_matches("lib")
+        .split(".so")
+        .next()
+        .unwrap_or(soname);
+
+    let mut dirs = Vec::new();
+    if let Some(dir) = preferred {
+        dirs.push(dir.to_path_buf());
+    }
+    dirs.extend(
+        [
+            "/opt/amazon/efa/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+            "/usr/local/lib",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+
+    dirs.into_iter()
+        .find(|dir| dir.join(soname).exists() || library_in_dir(dir, stem))
+}
+
+fn library_in_dir(dir: &Path, name: &str) -> bool {
+    [
+        dir.join(format!("lib{name}.so")),
+        dir.join(format!("lib{name}.a")),
+        dir.join(format!("lib{name}.dylib")),
+    ]
+    .iter()
+    .any(|path| path.exists())
 }
 
 /// Resolves libfabric include and library directories from, in order: explicit environment
@@ -97,9 +214,9 @@ fn locate_libfabric() -> (Option<PathBuf>, Option<PathBuf>) {
     }
 
     for prefix in [
+        "/opt/amazon/efa",
         "/opt/homebrew/opt/libfabric",
         "/usr/local",
-        "/opt/amazon/efa",
         "/usr",
     ] {
         let prefix = PathBuf::from(prefix);

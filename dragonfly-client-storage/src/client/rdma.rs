@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::rdma::fabric::Fabric;
+use crate::rdma::fabric::{Fabric, PooledBufReader};
 use crate::rdma::rendezvous::{
     read_frame, write_frame, Frame, PieceKind, PieceRequest, RdmaAdvertisement, WireCapability,
     ERROR_CODE_INCOMPATIBLE,
@@ -22,15 +22,10 @@ use crate::rdma::rendezvous::{
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
 use socket2::{SockRef, TcpKeepalive};
-use std::io::Cursor;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::time;
 use tracing::{debug, error, instrument, Span};
-
-/// DEFAULT_CHUNK_SIZE is the preferred fabric message size; the effective size is the
-/// minimum of both peers' limits and the provider's max message size.
-pub(crate) const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 /// MAX_CHUNKS caps the number of fabric messages (and thus posted receives) per piece.
 pub(crate) const MAX_CHUNKS: u64 = 4096;
@@ -115,7 +110,7 @@ impl RDMAClient {
         &self,
         number: u32,
         task_id: &str,
-    ) -> ClientResult<(Cursor<Vec<u8>>, u64, String)> {
+    ) -> ClientResult<(PooledBufReader, u64, String)> {
         Span::current().record("parent_addr", self.addr.as_str());
         time::timeout(
             self.config.download.piece_timeout,
@@ -133,7 +128,7 @@ impl RDMAClient {
         &self,
         number: u32,
         task_id: &str,
-    ) -> ClientResult<(Cursor<Vec<u8>>, u64, String)> {
+    ) -> ClientResult<(PooledBufReader, u64, String)> {
         Span::current().record("parent_addr", self.addr.as_str());
         time::timeout(
             self.config.download.piece_timeout,
@@ -151,7 +146,7 @@ impl RDMAClient {
         &self,
         number: u32,
         task_id: &str,
-    ) -> ClientResult<(Cursor<Vec<u8>>, u64, String)> {
+    ) -> ClientResult<(PooledBufReader, u64, String)> {
         Span::current().record("parent_addr", self.addr.as_str());
         time::timeout(
             self.config.download.piece_timeout,
@@ -170,7 +165,7 @@ impl RDMAClient {
         kind: PieceKind,
         number: u32,
         task_id: &str,
-    ) -> ClientResult<(Cursor<Vec<u8>>, u64, String)> {
+    ) -> ClientResult<(PooledBufReader, u64, String)> {
         let stream = TcpStream::connect(self.addr.clone()).await?;
         let socket = SockRef::from(&stream);
         socket.set_tcp_nodelay(true)?;
@@ -183,7 +178,11 @@ impl RDMAClient {
         let (mut reader, mut writer) = stream.into_split();
 
         let tag = self.fabric.next_tag();
-        let chunk_size = DEFAULT_CHUNK_SIZE.min(self.fabric.max_msg_size() as u64);
+        let configured_chunk_size = self.config.storage.server.rdma.chunk_size.as_u64();
+        if configured_chunk_size == 0 {
+            return Err(ClientError::InvalidParameter);
+        }
+        let chunk_size = configured_chunk_size.min(self.fabric.max_msg_size() as u64);
         write_frame(
             &mut writer,
             &Frame::Request(PieceRequest {
@@ -240,7 +239,7 @@ impl RDMAClient {
 
         // Post every receive before telling the parent to send (rendezvous ordering): EFA
         // has limited unexpected-message buffering, so the receiver must be ready first.
-        let buf = self.fabric.alloc_buffer(ready.length as usize).await?;
+        let buf = self.fabric.acquire_buffer(ready.length as usize).await?;
         let mut ops = Vec::with_capacity(chunk_count as usize);
         for chunk in 0..chunk_count {
             let offset = chunk * ready.chunk_size;
@@ -248,7 +247,12 @@ impl RDMAClient {
             ops.push((
                 len as usize,
                 self.fabric
-                    .post_recv(&buf, offset as usize, len as usize, tag.wrapping_add(chunk))
+                    .post_recv(
+                        buf.buffer(),
+                        offset as usize,
+                        len as usize,
+                        tag.wrapping_add(chunk),
+                    )
                     .await?,
             ));
         }
@@ -276,7 +280,6 @@ impl RDMAClient {
             )));
         }
 
-        let content = buf.into_vec();
-        Ok((Cursor::new(content), ready.offset, ready.digest))
+        Ok((buf.into_reader(), ready.offset, ready.digest))
     }
 }

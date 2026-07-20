@@ -16,9 +16,9 @@
 
 //! RDMA piece transport over libfabric.
 //!
-//! Both AWS EFA (SRD, no RC queue pairs, unreachable through raw ibverbs) and conventional
-//! RDMA (RoCE/InfiniBand via the verbs provider) are driven through libfabric as the single
-//! transport stack. The design is:
+//! Both AWS EFA (SRD, no RC queue pairs) and conventional RDMA (RoCE/InfiniBand through
+//! `verbs;ofi_rxm`) are driven through libfabric as the single transport stack. EFA-specific
+//! direct-verbs APIs exist, but standard RC-based ibverbs libraries cannot drive EFA. The design is:
 //!
 //! - control plane (piece request, capability negotiation, metadata, errors) over a TCP
 //!   rendezvous connection ([`rendezvous`]);
