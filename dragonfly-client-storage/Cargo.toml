@@ -37,6 +37,11 @@ walkdir = "2.5.0"
 quinn = "0.11.9"
 socket2 = "0.6.3"
 
+[features]
+# rdma enables the libfabric piece transport (AWS EFA and RoCE/InfiniBand verbs).
+# Requires libfabric headers and library at build time; see build.rs.
+rdma = []
+
 [dev-dependencies]
 tempfile.workspace = true
 criterion = "0.5"

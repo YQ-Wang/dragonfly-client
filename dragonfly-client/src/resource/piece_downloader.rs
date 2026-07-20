@@ -86,6 +86,8 @@ impl DownloaderFactory {
                 DEFAULT_DOWNLOADER_CAPACITY,
                 DEFAULT_DOWNLOADER_IDLE_TIMEOUT,
             )),
+            #[cfg(feature = "rdma")]
+            "rdma" => Arc::new(rdma::RDMADownloader::new(config.clone())),
             _ => {
                 error!("unsupported protocol: {}", protocol);
                 return Err(Error::InvalidParameter);
@@ -399,6 +401,287 @@ impl Downloader for TCPDownloader {
                 drop(request_guard);
                 self.remove_client_entry(key).await;
                 Err(err)
+            }
+        }
+    }
+}
+
+/// rdma provides the libfabric piece downloader (AWS EFA and RoCE/InfiniBand). It is an
+/// optimization layer: every error surfaces to the caller, which falls back to the TCP
+/// downloader for that piece.
+#[cfg(feature = "rdma")]
+pub mod rdma {
+    use super::*;
+    use dragonfly_client_config::dfdaemon::RdmaProvider;
+    use dragonfly_client_storage::client::rdma::{discover, RDMAClient};
+    use dragonfly_client_storage::rdma::fabric::Fabric;
+    use dragonfly_client_storage::rdma::rendezvous::{RdmaAdvertisement, WireCapability};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+    use tracing::{info, warn};
+
+    /// FABRIC_RETRY_INTERVAL is how long to wait before retrying fabric initialization
+    /// after a failure.
+    const FABRIC_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// INCOMPATIBLE_PARENT_TTL is how long a parent that reported fabric incompatibility
+    /// is skipped before RDMA is attempted again.
+    const INCOMPATIBLE_PARENT_TTL: Duration = Duration::from_secs(60);
+
+    /// CAPABLE_PARENT_TTL bounds how long a successful discovery result is reused.
+    const CAPABLE_PARENT_TTL: Duration = Duration::from_secs(60);
+
+    /// FabricState tracks the lazily initialized process-shared fabric endpoint.
+    enum FabricState {
+        /// Uninitialized means no initialization has been attempted yet.
+        Uninitialized,
+
+        /// Failed records when initialization last failed, for retry backoff.
+        Failed(Instant),
+
+        /// Ready holds the shared endpoint and the local negotiation capability.
+        Ready(Arc<Fabric>, WireCapability),
+    }
+
+    /// RDMADownloader downloads pieces over libfabric with a shared fabric endpoint. The
+    /// endpoint is opened lazily on the first download so a misconfigured or unsupported
+    /// host degrades to TCP instead of failing at startup.
+    pub struct RDMADownloader {
+        /// config is the configuration of the dfdaemon.
+        config: Arc<Config>,
+
+        /// fabric is the lazily initialized shared endpoint.
+        fabric: tokio::sync::Mutex<FabricState>,
+
+        /// incompatible_parents caches parents that reported fabric incompatibility so
+        /// every piece does not pay a doomed rendezvous round trip.
+        incompatible_parents: std::sync::Mutex<HashMap<String, Instant>>,
+
+        /// capable_parents caches successful discovery so every piece does not add a control
+        /// round trip. Transfer failures evict the entry immediately.
+        capable_parents: std::sync::Mutex<HashMap<String, (Instant, RdmaAdvertisement)>>,
+    }
+
+    /// RDMADownloader implements the downloader over the libfabric transport.
+    impl RDMADownloader {
+        /// new returns a new RDMADownloader.
+        pub fn new(config: Arc<Config>) -> Self {
+            Self {
+                config,
+                fabric: tokio::sync::Mutex::new(FabricState::Uninitialized),
+                incompatible_parents: std::sync::Mutex::new(HashMap::new()),
+                capable_parents: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// fabric returns the shared endpoint and local capability, initializing them on
+        /// first use and applying retry backoff after failures.
+        async fn fabric(&self) -> Result<(Arc<Fabric>, WireCapability)> {
+            let mut state = self.fabric.lock().await;
+            match &*state {
+                FabricState::Ready(fabric, capability) => {
+                    return Ok((fabric.clone(), capability.clone()))
+                }
+                FabricState::Failed(at) if at.elapsed() < FABRIC_RETRY_INTERVAL => {
+                    return Err(Error::Unsupported(
+                        "rdma fabric initialization failed recently".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+
+            let rdma_config = &self.config.storage.server.rdma;
+            if !rdma_config.enable {
+                *state = FabricState::Failed(Instant::now());
+                return Err(Error::Unsupported(
+                    "rdma is disabled in local configuration".to_string(),
+                ));
+            }
+            let Some(fabric_tag) = rdma_config
+                .fabric_tag
+                .as_deref()
+                .filter(|tag| !tag.is_empty())
+            else {
+                *state = FabricState::Failed(Instant::now());
+                return Err(Error::Unsupported(
+                    "rdma requires storage.server.rdma.fabricTag".to_string(),
+                ));
+            };
+
+            let provider = match rdma_config.provider {
+                RdmaProvider::Auto => None,
+                provider => Some(provider.to_string()),
+            };
+            match Fabric::new(
+                provider.as_deref(),
+                rdma_config.device.as_deref(),
+                rdma_config.max_registered_bytes.as_u64(),
+                rdma_config.allow_software_provider,
+            ) {
+                Ok(fabric) => {
+                    let fabric = Arc::new(fabric);
+                    let capability = WireCapability {
+                        provider: fabric.provider().to_string(),
+                        fabric_tag: fabric_tag.to_string(),
+                    };
+                    info!(
+                        "rdma downloader ready: provider {}, fabric tag {}",
+                        capability.provider, capability.fabric_tag
+                    );
+                    *state = FabricState::Ready(fabric.clone(), capability.clone());
+                    Ok((fabric, capability))
+                }
+                Err(err) => {
+                    warn!("rdma fabric initialization failed: {}", err);
+                    *state = FabricState::Failed(Instant::now());
+                    Err(err)
+                }
+            }
+        }
+
+        /// check_parent errors fast for parents recently reported incompatible.
+        fn check_parent(&self, addr: &str) -> Result<()> {
+            let mut incompatible_parents = self.incompatible_parents.lock().unwrap();
+            match incompatible_parents.get(addr) {
+                Some(at) if at.elapsed() < INCOMPATIBLE_PARENT_TTL => Err(Error::Unsupported(
+                    format!("parent {} is rdma-incompatible", addr),
+                )),
+                Some(_) => {
+                    incompatible_parents.remove(addr);
+                    Ok(())
+                }
+                None => Ok(()),
+            }
+        }
+
+        /// record_incompatible remembers that a parent reported fabric incompatibility.
+        fn record_incompatible(&self, addr: &str, err: &Error) {
+            self.capable_parents.lock().unwrap().remove(addr);
+            if matches!(err, Error::Unsupported(_)) {
+                self.incompatible_parents
+                    .lock()
+                    .unwrap()
+                    .insert(addr.to_string(), Instant::now());
+            }
+        }
+
+        /// advertisement returns a cached live capability or discovers it through the parent's
+        /// advertised TCP piece endpoint.
+        async fn advertisement(
+            &self,
+            addr: &str,
+            local: &WireCapability,
+        ) -> Result<RdmaAdvertisement> {
+            let cached = self.capable_parents.lock().unwrap().get(addr).cloned();
+            if let Some((at, advertisement)) = cached {
+                if at.elapsed() < CAPABLE_PARENT_TTL {
+                    return Ok(advertisement);
+                }
+                self.capable_parents.lock().unwrap().remove(addr);
+            }
+
+            let advertisement = discover(addr, self.config.storage.server.rdma.transfer_timeout)
+                .await
+                .map_err(|err| {
+                    Error::Unsupported(format!("rdma discovery from {} failed: {}", addr, err))
+                })?;
+            local
+                .compatible(&advertisement.capability)
+                .map_err(|reason| Error::Unsupported(format!("rdma incompatible: {}", reason)))?;
+            self.capable_parents
+                .lock()
+                .unwrap()
+                .insert(addr.to_string(), (Instant::now(), advertisement.clone()));
+            Ok(advertisement)
+        }
+
+        /// client builds an RDMAClient for one parent address.
+        async fn client(&self, addr: &str) -> Result<RDMAClient> {
+            self.check_parent(addr)?;
+            let (fabric, capability) = self.fabric().await?;
+            let advertisement = match self.advertisement(addr, &capability).await {
+                Ok(advertisement) => advertisement,
+                Err(err) => {
+                    self.record_incompatible(addr, &err);
+                    return Err(err);
+                }
+            };
+            let mut rendezvous_addr: SocketAddr = addr.parse().map_err(|err| {
+                Error::Unsupported(format!("invalid parent piece address {}: {}", addr, err))
+            })?;
+            rendezvous_addr.set_port(advertisement.port);
+            Ok(RDMAClient::new(
+                self.config.clone(),
+                fabric,
+                capability,
+                rendezvous_addr.to_string(),
+            ))
+        }
+    }
+
+    /// RDMADownloader implements the Downloader trait.
+    #[async_trait]
+    impl Downloader for RDMADownloader {
+        /// download_piece downloads a piece from the other peer over the fabric.
+        #[instrument(skip_all)]
+        async fn download_piece(
+            &self,
+            addr: &str,
+            number: u32,
+            _host_id: &str,
+            task_id: &str,
+        ) -> Result<(Box<dyn AsyncRead + Send + Unpin>, u64, String)> {
+            let client = self.client(addr).await?;
+            match client.download_piece(number, task_id).await {
+                Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
+                Err(err) => {
+                    self.record_incompatible(addr, &err);
+                    Err(err)
+                }
+            }
+        }
+
+        /// download_persistent_piece downloads a persistent piece from the other peer over
+        /// the fabric.
+        #[instrument(skip_all)]
+        async fn download_persistent_piece(
+            &self,
+            addr: &str,
+            number: u32,
+            _host_id: &str,
+            task_id: &str,
+        ) -> Result<(Box<dyn AsyncRead + Send + Unpin>, u64, String)> {
+            let client = self.client(addr).await?;
+            match client.download_persistent_piece(number, task_id).await {
+                Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
+                Err(err) => {
+                    self.record_incompatible(addr, &err);
+                    Err(err)
+                }
+            }
+        }
+
+        /// download_persistent_cache_piece downloads a persistent cache piece from the
+        /// other peer over the fabric.
+        #[instrument(skip_all)]
+        async fn download_persistent_cache_piece(
+            &self,
+            addr: &str,
+            number: u32,
+            _host_id: &str,
+            task_id: &str,
+        ) -> Result<(Box<dyn AsyncRead + Send + Unpin>, u64, String)> {
+            let client = self.client(addr).await?;
+            match client
+                .download_persistent_cache_piece(number, task_id)
+                .await
+            {
+                Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
+                Err(err) => {
+                    self.record_incompatible(addr, &err);
+                    Err(err)
+                }
             }
         }
     }

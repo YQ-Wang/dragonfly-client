@@ -252,6 +252,34 @@ fn default_storage_server_quic_port() -> u16 {
     4006
 }
 
+/// default_storage_server_rdma_port is the default TCP rendezvous port of the RDMA storage
+/// server. Piece payloads do not travel over this port.
+#[inline]
+fn default_storage_server_rdma_port() -> u16 {
+    4007
+}
+
+/// default_storage_server_rdma_provider probes supported hardware providers in preference order.
+#[inline]
+fn default_storage_server_rdma_provider() -> RdmaProvider {
+    RdmaProvider::Auto
+}
+
+/// default_storage_server_rdma_max_registered_bytes bounds memory pinned for in-flight RDMA
+/// transfers. The transport may use less than this value when the platform's memlock limit is
+/// lower.
+#[inline]
+fn default_storage_server_rdma_max_registered_bytes() -> ByteSize {
+    ByteSize::mib(512)
+}
+
+/// default_storage_server_rdma_transfer_timeout is the maximum time an RDMA operation may remain
+/// in flight before it is cancelled and the caller falls back to TCP.
+#[inline]
+fn default_storage_server_rdma_transfer_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
 /// default_storage_keep is the default keep of the task's metadata and content when the dfdaemon restarts.
 #[inline]
 fn default_storage_keep() -> bool {
@@ -925,6 +953,11 @@ pub struct StorageServer {
     /// Port is the port to the quic server.
     #[serde(default = "default_storage_server_quic_port")]
     pub quic_port: u16,
+
+    /// RDMA piece-transfer server configuration. RDMA is disabled by default and always retains
+    /// TCP as a fallback transport.
+    #[validate]
+    pub rdma: RdmaServer,
 }
 
 /// Storage implements Default.
@@ -935,6 +968,98 @@ impl Default for StorageServer {
             tcp_port: default_storage_server_tcp_port(),
             tcp_fastopen: false,
             quic_port: default_storage_server_quic_port(),
+            rdma: RdmaServer::default(),
+        }
+    }
+}
+
+/// RdmaProvider selects the libfabric provider used by the RDMA piece transport. EFA is not an
+/// ibverbs RC transport, so both AWS EFA and conventional RDMA are accessed through libfabric.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RdmaProvider {
+    /// Auto probes EFA and verbs hardware providers in preference order. The concrete provider
+    /// selected at runtime is advertised to peers; `auto` is never a wire capability.
+    #[default]
+    Auto,
+
+    /// Efa selects Amazon's EFA provider and its reliable datagram endpoint.
+    Efa,
+
+    /// Verbs selects the libfabric verbs provider (normally with the RxM utility provider) for
+    /// RoCE or InfiniBand devices.
+    Verbs,
+}
+
+impl fmt::Display for RdmaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Efa => write!(f, "efa"),
+            Self::Verbs => write!(f, "verbs"),
+        }
+    }
+}
+
+/// RdmaServer configures the optional Linux/libfabric bulk-piece transport. The TCP storage
+/// server remains required for rendezvous and per-piece fallback.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RdmaServer {
+    /// Enable the RDMA storage server and allow the downloader to prefer compatible RDMA peers.
+    pub enable: bool,
+
+    /// TCP port used for reliable rendezvous, capability exchange, metadata, and errors. Bulk
+    /// piece bytes move over libfabric rather than this socket.
+    #[serde(default = "default_storage_server_rdma_port")]
+    #[validate(range(min = 1))]
+    pub port: u16,
+
+    /// Libfabric provider selection. `auto` is resolved to a concrete provider before a peer
+    /// capability is advertised.
+    #[serde(default = "default_storage_server_rdma_provider")]
+    pub provider: RdmaProvider,
+
+    /// Permit libfabric software providers such as `tcp` when `provider` is `auto`. This is
+    /// intended for development and CI only; production defaults to hardware providers.
+    pub allow_software_provider: bool,
+
+    /// Optional libfabric domain/device name, for example `efa_0-rdm`.
+    pub device: Option<String>,
+
+    /// Operator-supplied reachability-domain label. Peers attempt RDMA only when both advertise
+    /// the same non-empty value. On EFA this should identify a VPC and Availability Zone, not a
+    /// placement group (which is a performance recommendation, not a reachability requirement).
+    #[validate(length(min = 1))]
+    pub fabric_tag: Option<String>,
+
+    /// Upper bound on bytes pinned or registered by the transport for in-flight operations.
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_storage_server_rdma_max_registered_bytes"
+    )]
+    pub max_registered_bytes: ByteSize,
+
+    /// Maximum duration of one fabric operation before cancellation and TCP fallback.
+    #[serde(
+        default = "default_storage_server_rdma_transfer_timeout",
+        with = "humantime_serde"
+    )]
+    pub transfer_timeout: Duration,
+}
+
+/// RdmaServer implements Default.
+impl Default for RdmaServer {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            port: default_storage_server_rdma_port(),
+            provider: default_storage_server_rdma_provider(),
+            allow_software_provider: false,
+            device: None,
+            fabric_tag: None,
+            max_registered_bytes: default_storage_server_rdma_max_registered_bytes(),
+            transfer_timeout: default_storage_server_rdma_transfer_timeout(),
         }
     }
 }
@@ -2104,7 +2229,17 @@ key: /etc/ssl/private/client.pem
             "server": {
                 "ip": "128.0.0.1",
                 "tcpPort": 4005,
-                "quicPort": 4006
+                "quicPort": 4006,
+                "rdma": {
+                    "enable": true,
+                    "port": 4007,
+                    "provider": "efa",
+                    "allowSoftwareProvider": false,
+                    "device": "efa_0-rdm",
+                    "fabricTag": "vpc-123/use1-az1",
+                    "maxRegisteredBytes": "1GiB",
+                    "transferTimeout": "15s"
+                }
             },
             "dir": "/tmp/storage",
             "keep": true,
@@ -2121,12 +2256,48 @@ key: /etc/ssl/private/client.pem
         );
         assert_eq!(storage.server.tcp_port, 4005);
         assert_eq!(storage.server.quic_port, 4006);
+        assert!(storage.server.rdma.enable);
+        assert_eq!(storage.server.rdma.port, 4007);
+        assert_eq!(storage.server.rdma.provider, RdmaProvider::Efa);
+        assert!(!storage.server.rdma.allow_software_provider);
+        assert_eq!(storage.server.rdma.device.as_deref(), Some("efa_0-rdm"));
+        assert_eq!(
+            storage.server.rdma.fabric_tag.as_deref(),
+            Some("vpc-123/use1-az1")
+        );
+        assert_eq!(storage.server.rdma.max_registered_bytes, ByteSize::gib(1));
+        assert_eq!(
+            storage.server.rdma.transfer_timeout,
+            Duration::from_secs(15)
+        );
         assert_eq!(storage.dir, PathBuf::from("/tmp/storage"));
         assert!(storage.keep);
         assert_eq!(storage.write_piece_timeout, Duration::from_secs(20));
         assert_eq!(storage.write_buffer_size, 8 * 1024 * 1024);
         assert_eq!(storage.read_buffer_size, 8 * 1024 * 1024);
         assert_eq!(storage.cache_capacity, ByteSize::mb(256));
+    }
+
+    #[test]
+    fn default_rdma_server_is_safe() {
+        let rdma = RdmaServer::default();
+        assert!(!rdma.enable);
+        assert_eq!(rdma.port, 4007);
+        assert_eq!(rdma.provider, RdmaProvider::Auto);
+        assert!(!rdma.allow_software_provider);
+        assert!(rdma.device.is_none());
+        assert!(rdma.fabric_tag.is_none());
+        assert_eq!(rdma.max_registered_bytes, ByteSize::mib(512));
+        assert_eq!(rdma.transfer_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn reject_empty_rdma_fabric_tag() {
+        let rdma = RdmaServer {
+            fabric_tag: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(rdma.validate().is_err());
     }
 
     #[test]

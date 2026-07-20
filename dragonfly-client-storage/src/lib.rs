@@ -43,6 +43,7 @@ pub mod cache;
 pub mod client;
 pub mod content;
 pub mod metadata;
+pub mod rdma;
 pub mod server;
 pub mod storage_engine;
 

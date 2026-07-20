@@ -71,6 +71,11 @@ pub struct Piece {
     /// quic_downloader is the QUIC piece downloader.
     quic_downloader: Arc<dyn piece_downloader::Downloader>,
 
+    /// rdma_downloader is the libfabric piece downloader (AWS EFA, RoCE/InfiniBand). It is
+    /// only Some when the client is built with the `rdma` feature and the download protocol
+    /// is "rdma"; every RDMA failure falls back to the TCP downloader for that piece.
+    rdma_downloader: Option<Arc<dyn piece_downloader::Downloader>>,
+
     /// backend_factory is the backend factory.
     backend_factory: Arc<BackendFactory>,
 
@@ -95,12 +100,27 @@ impl Piece {
         prefetch_bandwidth_limiter: Arc<RateLimiter>,
         back_to_source_bandwidth_limiter: Arc<RateLimiter>,
     ) -> Result<Self> {
+        #[cfg(feature = "rdma")]
+        let rdma_downloader = if config.download.protocol == "rdma" {
+            Some(piece_downloader::DownloaderFactory::new("rdma", config.clone())?.build())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "rdma"))]
+        let rdma_downloader = {
+            if config.download.protocol == "rdma" {
+                warn!("download protocol is rdma but this build lacks the rdma feature, using tcp");
+            }
+            None
+        };
+
         Ok(Self {
             config: config.clone(),
             storage,
             tcp_downloader: piece_downloader::DownloaderFactory::new("tcp", config.clone())?
                 .build(),
             quic_downloader: piece_downloader::DownloaderFactory::new("quic", config)?.build(),
+            rdma_downloader,
             backend_factory,
             download_bandwidth_limiter,
             prefetch_bandwidth_limiter,
@@ -401,6 +421,46 @@ impl Piece {
             }
             ("quic", Some(ip), _, Some(port)) => {
                 self.quic_downloader
+                    .download_piece(
+                        &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await?
+            }
+            ("rdma", Some(ip), Some(download_tcp_port), _) if self.rdma_downloader.is_some() => {
+                let ip = IpAddr::from_str(&ip)?;
+                let rdma_downloader = self.rdma_downloader.as_ref().unwrap();
+                match rdma_downloader
+                    .download_piece(
+                        // RDMA discovery is multiplexed on the parent's advertised TCP piece
+                        // endpoint and returns its actual rendezvous port.
+                        &format_socket_addr(ip, download_tcp_port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await
+                {
+                    Ok(downloaded) => downloaded,
+                    // RDMA is an optimization: any rendezvous or fabric error falls back to
+                    // the parent's TCP piece server for this piece.
+                    Err(err) => {
+                        warn!("rdma download failed, fall back to tcp downloader: {}", err);
+                        self.tcp_downloader
+                            .download_piece(
+                                &format_socket_addr(ip, download_tcp_port as u16),
+                                number,
+                                host_id,
+                                task_id,
+                            )
+                            .await?
+                    }
+                }
+            }
+            ("rdma", Some(ip), Some(port), _) => {
+                self.tcp_downloader
                     .download_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
                         number,
@@ -800,6 +860,44 @@ impl Piece {
                     )
                     .await?
             }
+            ("rdma", Some(ip), Some(download_tcp_port), _) if self.rdma_downloader.is_some() => {
+                let ip = IpAddr::from_str(&ip)?;
+                let rdma_downloader = self.rdma_downloader.as_ref().unwrap();
+                match rdma_downloader
+                    .download_persistent_piece(
+                        &format_socket_addr(ip, download_tcp_port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await
+                {
+                    Ok(downloaded) => downloaded,
+                    // RDMA is an optimization: any rendezvous or fabric error falls back to
+                    // the parent's TCP piece server for this piece.
+                    Err(err) => {
+                        warn!("rdma download failed, fall back to tcp downloader: {}", err);
+                        self.tcp_downloader
+                            .download_persistent_piece(
+                                &format_socket_addr(ip, download_tcp_port as u16),
+                                number,
+                                host_id,
+                                task_id,
+                            )
+                            .await?
+                    }
+                }
+            }
+            ("rdma", Some(ip), Some(port), _) => {
+                self.tcp_downloader
+                    .download_persistent_piece(
+                        &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await?
+            }
             _ => {
                 warn!("fall back to grpc downloader");
                 let host = parent.host.clone().ok_or_else(|| {
@@ -1137,6 +1235,44 @@ impl Piece {
                 let quic_downloader =
                     piece_downloader::DownloaderFactory::new("quic", self.config.clone())?.build();
                 quic_downloader
+                    .download_persistent_cache_piece(
+                        &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await?
+            }
+            ("rdma", Some(ip), Some(download_tcp_port), _) if self.rdma_downloader.is_some() => {
+                let ip = IpAddr::from_str(&ip)?;
+                let rdma_downloader = self.rdma_downloader.as_ref().unwrap();
+                match rdma_downloader
+                    .download_persistent_cache_piece(
+                        &format_socket_addr(ip, download_tcp_port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await
+                {
+                    Ok(downloaded) => downloaded,
+                    // RDMA is an optimization: any rendezvous or fabric error falls back to
+                    // the parent's TCP piece server for this piece.
+                    Err(err) => {
+                        warn!("rdma download failed, fall back to tcp downloader: {}", err);
+                        self.tcp_downloader
+                            .download_persistent_cache_piece(
+                                &format_socket_addr(ip, download_tcp_port as u16),
+                                number,
+                                host_id,
+                                task_id,
+                            )
+                            .await?
+                    }
+                }
+            }
+            ("rdma", Some(ip), Some(port), _) => {
+                self.tcp_downloader
                     .download_persistent_cache_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
                         number,
