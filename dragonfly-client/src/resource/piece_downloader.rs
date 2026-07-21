@@ -480,8 +480,13 @@ pub mod rdma {
         async fn fabric(&self) -> Result<(Arc<Fabric>, WireCapability)> {
             let mut state = self.fabric.lock().await;
             match &*state {
-                FabricState::Ready(fabric, capability) => {
+                FabricState::Ready(fabric, capability) if !fabric.is_failed() => {
                     return Ok((fabric.clone(), capability.clone()))
+                }
+                FabricState::Ready(_, _) => {
+                    // A retired endpoint cannot recover by returning errors forever. Drop it
+                    // and let the normal initialization path create a fresh provider endpoint.
+                    *state = FabricState::Uninitialized;
                 }
                 FabricState::Failed(at) if at.elapsed() < FABRIC_RETRY_INTERVAL => {
                     return Err(Error::Unsupported(
@@ -531,6 +536,15 @@ pub mod rdma {
                     *state = FabricState::Failed(Instant::now());
                     Err(err)
                 }
+            }
+        }
+
+        /// retire_failed_fabric removes a poisoned shared endpoint after a transfer failure.
+        /// Ordinary peer incompatibility leaves the shared endpoint intact.
+        async fn retire_failed_fabric(&self) {
+            let mut state = self.fabric.lock().await;
+            if matches!(&*state, FabricState::Ready(fabric, _) if fabric.is_failed()) {
+                *state = FabricState::Uninitialized;
             }
         }
 
@@ -630,6 +644,9 @@ pub mod rdma {
             match client.download_piece(number, task_id).await {
                 Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
                 Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
                     self.record_incompatible(addr, &err);
                     Err(err)
                 }
@@ -650,6 +667,9 @@ pub mod rdma {
             match client.download_persistent_piece(number, task_id).await {
                 Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
                 Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
                     self.record_incompatible(addr, &err);
                     Err(err)
                 }
@@ -673,6 +693,9 @@ pub mod rdma {
             {
                 Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
                 Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
                     self.record_incompatible(addr, &err);
                     Err(err)
                 }

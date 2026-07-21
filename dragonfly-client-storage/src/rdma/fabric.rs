@@ -39,7 +39,7 @@ use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -73,6 +73,7 @@ mod ffi {
             out: *mut *mut DfrdmaFabric,
         ) -> c_int;
         pub fn dfrdma_close(f: *mut DfrdmaFabric);
+        pub fn dfrdma_close_endpoint(f: *mut DfrdmaFabric) -> c_int;
         pub fn dfrdma_provider_name(f: *mut DfrdmaFabric) -> *const c_char;
         pub fn dfrdma_max_msg_size(f: *mut DfrdmaFabric) -> usize;
         pub fn dfrdma_mr_required(f: *mut DfrdmaFabric) -> c_int;
@@ -191,8 +192,14 @@ struct PendingOp {
     _buf: Arc<PinnedBuf>,
 }
 
-/// Handle owns the raw fabric pointer and closes it on drop.
-struct Handle(*mut ffi::DfrdmaFabric);
+/// Handle owns the raw fabric pointer. Endpoint calls take a shared lifecycle lock, while
+/// failure recovery takes the exclusive lock to close the endpoint before pending buffers
+/// are released. The remaining domain objects stay alive until the last registered buffer drops.
+struct Handle {
+    raw: *mut ffi::DfrdmaFabric,
+    endpoint_lifecycle: RwLock<()>,
+    endpoint_open: AtomicBool,
+}
 
 /// Safety: the shim rejects providers that do not grant FI_THREAD_SAFE, and the handle is
 /// closed only after the progress thread exits.
@@ -201,10 +208,29 @@ unsafe impl Sync for Handle {}
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Safety: the pointer came from dfrdma_open and is dropped exactly once, after the
-        // progress thread has exited and all memory regions were closed (PinnedBuf holds an
-        // Arc<FabricInner>, so buffers cannot outlive this handle).
-        unsafe { ffi::dfrdma_close(self.0) };
+        // Safety: the pointer came from dfrdma_open and is dropped exactly once. Registered
+        // buffers hold an Arc<Handle>, so their MRs close before this last owner disappears.
+        unsafe { ffi::dfrdma_close(self.raw) };
+    }
+}
+
+impl Handle {
+    /// close_endpoint prevents further DMA before failure recovery releases pending buffers.
+    fn close_endpoint(&self) -> bool {
+        let _lifecycle = self.endpoint_lifecycle.write().unwrap();
+        if !self.endpoint_open.load(Ordering::Acquire) {
+            return true;
+        }
+        // Safety: raw remains valid for the lifetime of Handle. The exclusive lifecycle lock
+        // excludes posts, cancellation, and CQ reads while fi_close operates on the endpoint.
+        let rc = unsafe { ffi::dfrdma_close_endpoint(self.raw) };
+        if rc == 0 {
+            self.endpoint_open.store(false, Ordering::Release);
+            true
+        } else {
+            error!("failed to close rdma endpoint during recovery: {}", rc);
+            false
+        }
     }
 }
 
@@ -215,9 +241,9 @@ struct FabricInner {
     /// take this lock.
     cancel_progress_lock: Mutex<()>,
 
-    /// handle is the raw fabric handle; declared after cancel_progress_lock but dropped first among
-    /// users because buffers and the progress thread hold Arcs to this struct.
-    handle: Handle,
+    /// handle owns the fabric objects independently from FabricInner. Pinned buffers retain this
+    /// handle directly, avoiding a pending -> buffer -> FabricInner ownership cycle.
+    handle: Arc<Handle>,
 
     /// pending maps context addresses to in-flight operations.
     pending: Mutex<HashMap<usize, PendingOp>>,
@@ -228,37 +254,101 @@ struct FabricInner {
     /// shutdown stops the progress thread.
     shutdown: AtomicBool,
 
+    /// failed rejects new work after an unrecoverable operation or CQ failure.
+    failed: AtomicBool,
+
+    /// failure_reason records the first fatal error for callers and diagnostics.
+    failure_reason: Mutex<Option<String>>,
+
+    /// failure_notify wakes buffer waiters when the endpoint is retired.
+    failure_notify: Notify,
+
     /// mr_required is true when the provider needs local buffers registered.
     mr_required: bool,
 }
 
 impl FabricInner {
-    /// mr_close closes a memory region.
-    fn mr_close(&self, mr: *mut c_void) {
-        if mr.is_null() {
+    /// failure returns the first fatal fabric error.
+    fn failure(&self) -> Option<String> {
+        self.failure_reason.lock().unwrap().clone()
+    }
+
+    /// ensure_healthy rejects work after the endpoint has been retired.
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::Unknown(
+                self.failure()
+                    .unwrap_or_else(|| "rdma fabric is unavailable".to_string()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// fail_and_abort permanently retires this endpoint. Pending buffers are released only
+    /// after endpoint close succeeds; otherwise they remain quarantined for memory safety.
+    fn fail_and_abort(&self, reason: String) {
+        if self
+            .failed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
-        // Safety: mr came from dfrdma_mr_reg on this handle and is closed exactly once.
-        // The negotiated FI_THREAD_SAFE contract permits concurrent calls on the domain.
-        let rc = unsafe { ffi::dfrdma_mr_close(mr) };
-        if rc != 0 {
-            warn!("failed to close rdma memory region: {}", rc);
+        *self.failure_reason.lock().unwrap() = Some(reason.clone());
+        error!("retiring rdma fabric: {}", reason);
+
+        let _progress_guard = self.cancel_progress_lock.lock().unwrap();
+        if self.handle.close_endpoint() {
+            // Closing the endpoint is the EFA-supported way to abort posted receives. Once it
+            // succeeds the NIC can no longer access these contexts or buffers.
+            self.pending.lock().unwrap().clear();
+        } else {
+            error!(
+                "rdma endpoint close failed; pending buffers remain quarantined for process lifetime"
+            );
         }
+        self.failure_notify.notify_waiters();
     }
 
     /// cancel_ctx attempts to cancel an operation that is still tracked. CQ progress cannot
     /// remove and free the context between this lookup and fi_cancel.
     fn cancel_ctx(&self, ctx_addr: usize) {
-        let _progress_guard = self.cancel_progress_lock.lock().unwrap();
-        if !self.pending.lock().unwrap().contains_key(&ctx_addr) {
-            return;
-        }
+        let cancel_error = {
+            let _progress_guard = self.cancel_progress_lock.lock().unwrap();
+            if self.failed.load(Ordering::Acquire)
+                || !self.pending.lock().unwrap().contains_key(&ctx_addr)
+            {
+                None
+            } else {
+                let _lifecycle = self.handle.endpoint_lifecycle.read().unwrap();
+                if !self.handle.endpoint_open.load(Ordering::Acquire) {
+                    None
+                } else {
+                    // Safety: the pending entry owns the context block. The shim normalizes
+                    // an already-completed operation to success; other failures are fatal
+                    // because the provider may continue to access the buffer.
+                    let rc =
+                        unsafe { ffi::dfrdma_cancel(self.handle.raw, ctx_addr as *mut c_void) };
+                    (rc != 0).then_some(rc)
+                }
+            }
+        };
 
-        // Safety: the pending entry owns the context block. If the provider has already queued
-        // its completion, fi_cancel returns an appropriate not-found/already-complete error.
-        let rc = unsafe { ffi::dfrdma_cancel(self.handle.0, ctx_addr as *mut c_void) };
-        if rc != 0 {
-            warn!("fi_cancel failed: {}", rc);
+        if let Some(rc) = cancel_error {
+            self.fail_and_abort(format!("rdma operation cancellation failed: {}", rc));
+        }
+    }
+}
+
+impl Drop for FabricInner {
+    fn drop(&mut self) {
+        if self.handle.endpoint_open.load(Ordering::Acquire) {
+            let pending = std::mem::take(self.pending.get_mut().unwrap());
+            if !pending.is_empty() {
+                // Endpoint close failed, so the provider may still own these buffers. Leaking
+                // the pending map also retains Handle and is safer than freeing DMA memory.
+                std::mem::forget(pending);
+            }
         }
     }
 }
@@ -270,8 +360,8 @@ struct MrGuard {
     /// mr is the raw memory-region handle, null when the buffer is unregistered.
     mr: *mut c_void,
 
-    /// inner is the owning fabric.
-    inner: Arc<FabricInner>,
+    /// handle keeps the domain alive until this registration has closed.
+    _handle: Arc<Handle>,
 }
 
 /// Safety: the owning fabric requires FI_THREAD_SAFE and closes the registration before freeing it.
@@ -280,7 +370,15 @@ unsafe impl Sync for MrGuard {}
 
 impl Drop for MrGuard {
     fn drop(&mut self) {
-        self.inner.mr_close(self.mr);
+        if self.mr.is_null() {
+            return;
+        }
+        // Safety: mr came from dfrdma_mr_reg and is closed exactly once. Handle remains alive
+        // through this guard, and endpoint teardown deliberately leaves the domain open.
+        let rc = unsafe { ffi::dfrdma_mr_close(self.mr) };
+        if rc != 0 {
+            warn!("failed to close rdma memory region: {}", rc);
+        }
     }
 }
 
@@ -715,12 +813,20 @@ impl Fabric {
             .min(Semaphore::MAX_PERMITS as u64)
             .min(u32::MAX as u64) as u32;
 
+        let handle = Arc::new(Handle {
+            raw: handle,
+            endpoint_lifecycle: RwLock::new(()),
+            endpoint_open: AtomicBool::new(true),
+        });
         let inner = Arc::new(FabricInner {
             cancel_progress_lock: Mutex::new(()),
-            handle: Handle(handle),
+            handle,
             pending: Mutex::new(HashMap::new()),
             av: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            failure_reason: Mutex::new(None),
+            failure_notify: Notify::new(),
             mr_required,
         });
 
@@ -755,6 +861,12 @@ impl Fabric {
     /// provider returns the concrete provider name selected at runtime.
     pub fn provider(&self) -> &str {
         &self.provider
+    }
+
+    /// is_failed reports whether the endpoint has been retired after an unrecoverable
+    /// operation or completion-queue failure.
+    pub fn is_failed(&self) -> bool {
+        self.inner.failed.load(Ordering::Acquire)
     }
 
     /// local_endpoint returns the provider-opaque endpoint address to advertise to peers.
@@ -799,11 +911,13 @@ impl Fabric {
         let permits = self.buffer_permits(len)?;
 
         loop {
+            self.inner.ensure_healthy()?;
             if self.pool.closed.load(Ordering::Acquire) {
                 return Err(Error::Unknown("rdma fabric is shut down".to_string()));
             }
 
             let changed = self.pool.changed.notified();
+            let failed = self.inner.failure_notify.notified();
             if let Some(buf) = self.pool.take_best_fit(len) {
                 return Ok(PooledBuf {
                     buf: Some(buf),
@@ -831,6 +945,13 @@ impl Fabric {
             let budget = self.budget.clone();
             tokio::select! {
                 _ = changed => continue,
+                _ = failed => {
+                    return Err(Error::Unknown(
+                        self.inner
+                            .failure()
+                            .unwrap_or_else(|| "rdma fabric is unavailable".to_string()),
+                    ));
+                },
                 permit = budget.acquire_many_owned(permits) => {
                     let permit = permit.map_err(|_| {
                         Error::Unknown("rdma fabric is shut down".to_string())
@@ -871,6 +992,7 @@ impl Fabric {
 
     /// register_buffer allocates stable storage and registers it using an already-owned budget.
     fn register_buffer(&self, len: usize, permit: OwnedSemaphorePermit) -> Result<Arc<PinnedBuf>> {
+        self.inner.ensure_healthy()?;
         let mut data = vec![0u8; len];
         let mut mr: *mut c_void = std::ptr::null_mut();
         let mut desc: *mut c_void = std::ptr::null_mut();
@@ -879,7 +1001,7 @@ impl Fabric {
         // registration concurrently with endpoint and CQ operations.
         let rc = unsafe {
             ffi::dfrdma_mr_reg(
-                self.inner.handle.0,
+                self.inner.handle.raw,
                 data.as_mut_ptr() as *mut c_void,
                 len,
                 &mut mr,
@@ -901,7 +1023,7 @@ impl Fabric {
         Ok(Arc::new(PinnedBuf {
             mr_guard: MrGuard {
                 mr,
-                inner: self.inner.clone(),
+                _handle: self.inner.handle.clone(),
             },
             desc,
             data: UnsafeCell::new(data),
@@ -912,6 +1034,11 @@ impl Fabric {
     /// resolve inserts a peer endpoint address into the address vector, returning its
     /// fabric address. Results are cached.
     pub fn resolve(&self, endpoint: &[u8]) -> Result<u64> {
+        self.inner.ensure_healthy()?;
+        let _lifecycle = self.inner.handle.endpoint_lifecycle.read().unwrap();
+        if !self.inner.handle.endpoint_open.load(Ordering::Acquire) {
+            return Err(Error::Unknown("rdma endpoint is closed".to_string()));
+        }
         // Hold the cache lock through insertion to avoid racing duplicate AV entries.
         let mut av = self.inner.av.lock().unwrap();
         if let Some(addr) = av.get(endpoint) {
@@ -923,7 +1050,7 @@ impl Fabric {
         // concurrent access to the address vector and endpoint.
         let rc = unsafe {
             ffi::dfrdma_av_insert(
-                self.inner.handle.0,
+                self.inner.handle.raw,
                 endpoint.as_ptr(),
                 endpoint.len(),
                 &mut addr,
@@ -970,6 +1097,7 @@ impl Fabric {
         tag: u64,
         dest: Option<u64>,
     ) -> Result<OpHandle> {
+        self.inner.ensure_healthy()?;
         if offset.checked_add(len).is_none_or(|end| end > buf.len()) {
             return Err(Error::InvalidParameter);
         }
@@ -991,28 +1119,39 @@ impl Fabric {
 
         let deadline = tokio::time::Instant::now() + POST_RETRY_TIMEOUT;
         loop {
-            // Safety: buf outlives the operation via the pending map; the range was
-            // validated above; ctx_addr points at the boxed context block owned by the
-            // pending map. The shim requires FI_THREAD_SAFE, so posts may run concurrently.
-            let rc = unsafe {
-                match dest {
-                    Some(dest) => ffi::dfrdma_tsend(
-                        self.inner.handle.0,
-                        buf.ptr(offset) as *const c_void,
-                        len,
-                        buf.desc,
-                        dest,
-                        tag,
-                        ctx_addr as *mut c_void,
-                    ),
-                    None => ffi::dfrdma_trecv(
-                        self.inner.handle.0,
-                        buf.ptr(offset) as *mut c_void,
-                        len,
-                        buf.desc,
-                        tag,
-                        ctx_addr as *mut c_void,
-                    ),
+            if let Err(err) = self.inner.ensure_healthy() {
+                self.inner.pending.lock().unwrap().remove(&ctx_addr);
+                return Err(err);
+            }
+            let rc = {
+                let _lifecycle = self.inner.handle.endpoint_lifecycle.read().unwrap();
+                if !self.inner.handle.endpoint_open.load(Ordering::Acquire) {
+                    self.inner.pending.lock().unwrap().remove(&ctx_addr);
+                    return Err(Error::Unknown("rdma endpoint is closed".to_string()));
+                }
+                // Safety: buf outlives the operation via the pending map; the range was
+                // validated above; ctx_addr points at the boxed context block owned by the
+                // pending map. The shim requires FI_THREAD_SAFE, so posts may run concurrently.
+                unsafe {
+                    match dest {
+                        Some(dest) => ffi::dfrdma_tsend(
+                            self.inner.handle.raw,
+                            buf.ptr(offset) as *const c_void,
+                            len,
+                            buf.desc,
+                            dest,
+                            tag,
+                            ctx_addr as *mut c_void,
+                        ),
+                        None => ffi::dfrdma_trecv(
+                            self.inner.handle.raw,
+                            buf.ptr(offset) as *mut c_void,
+                            len,
+                            buf.desc,
+                            tag,
+                            ctx_addr as *mut c_void,
+                        ),
+                    }
                 }
             };
 
@@ -1077,8 +1216,9 @@ impl Fabric {
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {
-                        error!(
-                            "rdma operation neither completed nor cancelled; leaking its buffer"
+                        error!("rdma operation neither completed nor cancelled; retiring endpoint");
+                        self.inner.fail_and_abort(
+                            "rdma operation cancellation grace period expired".to_string(),
                         );
                         break;
                     }
@@ -1093,6 +1233,11 @@ impl Fabric {
 
 impl Drop for Fabric {
     fn drop(&mut self) {
+        // Close the endpoint before releasing pending buffers. This is required for EFA posted
+        // receives whose peer disappeared and also prevents FabricInner's defensive drop path
+        // from having to retain a live DMA buffer forever during ordinary shutdown.
+        self.inner
+            .fail_and_abort("rdma fabric shutting down".to_string());
         self.inner.shutdown.store(true, Ordering::Relaxed);
         if let Some(progress) = self.progress.take() {
             let _ = progress.join();
@@ -1100,9 +1245,6 @@ impl Drop for Fabric {
         // Release idle registrations before the endpoint handle can close. Leases still held by
         // downstream readers observe the closed pool and release their buffers on drop.
         self.pool.close();
-        // Pending operations are NOT cleared here: their buffers must stay alive until the
-        // endpoint closes. FabricInner's field order (handle before pending) closes the
-        // endpoint before the map releases the buffers.
     }
 }
 
@@ -1111,7 +1253,7 @@ impl Drop for Fabric {
 /// success path.
 fn progress_loop(inner: Arc<FabricInner>) {
     let mut active_yields = 0u32;
-    while !inner.shutdown.load(Ordering::Relaxed) {
+    while !inner.shutdown.load(Ordering::Relaxed) && !inner.failed.load(Ordering::Acquire) {
         let mut progressed = false;
         loop {
             let mut entries = [ffi::DfrdmaCompletion {
@@ -1129,8 +1271,12 @@ fn progress_loop(inner: Arc<FabricInner>) {
                 // Safety: the handle is valid until FabricInner drops, which cannot happen
                 // while this thread holds an Arc to it. FI_THREAD_SAFE permits concurrent
                 // posts on other threads; entries has the capacity passed to the shim.
+                let _lifecycle = inner.handle.endpoint_lifecycle.read().unwrap();
+                if !inner.handle.endpoint_open.load(Ordering::Acquire) {
+                    return;
+                }
                 let rc = unsafe {
-                    ffi::dfrdma_cq_read_batch(inner.handle.0, entries.as_mut_ptr(), entries.len())
+                    ffi::dfrdma_cq_read_batch(inner.handle.raw, entries.as_mut_ptr(), entries.len())
                 };
                 if rc > 0 {
                     // Batched removal under the cancellation/CQ lock closes the lifetime gap
@@ -1171,7 +1317,7 @@ fn progress_loop(inner: Arc<FabricInner>) {
                 }
                 0 => break,
                 rc => {
-                    error!("rdma completion queue read failed: {}", rc);
+                    inner.fail_and_abort(format!("rdma completion queue read failed: {}", rc));
                     return;
                 }
             }
@@ -1363,6 +1509,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(Arc::as_ptr(second.buffer()) as usize, first_ptr);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retired_fabric_wakes_buffer_waiters() {
+        let fabric =
+            Arc::new(Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint"));
+        let held = fabric.acquire_buffer(1024 * 1024).await.unwrap();
+
+        let waiting_fabric = fabric.clone();
+        let waiter = tokio::spawn(async move { waiting_fabric.acquire_buffer(1024 * 1024).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        fabric
+            .inner
+            .fail_and_abort("test endpoint failure".to_string());
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("buffer waiter did not wake")
+            .expect("buffer waiter task panicked");
+        assert!(result.is_err());
+        assert!(fabric.is_failed());
+        drop(held);
     }
 
     #[tokio::test(flavor = "multi_thread")]

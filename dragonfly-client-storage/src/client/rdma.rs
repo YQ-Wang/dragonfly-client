@@ -102,6 +102,12 @@ impl RDMAClient {
         }
     }
 
+    /// fabric_failed reports whether the shared endpoint has been retired and should be
+    /// recreated by the downloader before another RDMA attempt.
+    pub fn fabric_failed(&self) -> bool {
+        self.fabric.is_failed()
+    }
+
     /// Downloads a piece from the parent, returning the piece content reader, offset, and
     /// digest exactly like the TCP and QUIC clients so digest verification upstream is
     /// byte-identical.

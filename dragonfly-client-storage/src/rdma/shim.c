@@ -96,6 +96,26 @@ void dfrdma_close(dfrdma_fabric *f)
 }
 
 /*
+ * Closes only the endpoint so outstanding receives can no longer reference application
+ * buffers. The domain and its memory registrations intentionally remain alive; Rust drops
+ * the now-safe pending buffers/MRs before the final dfrdma_close tears down the remaining
+ * fabric objects.
+ */
+int dfrdma_close_endpoint(dfrdma_fabric *f)
+{
+    int rc;
+
+    if (f == NULL || f->ep == NULL) {
+        return 0;
+    }
+    rc = fi_close(&f->ep->fid);
+    if (rc == 0) {
+        f->ep = NULL;
+    }
+    return rc;
+}
+
+/*
  * Prefers a non-efa-direct fi_info entry. Raw `fi_info -p efa` often lists efa-direct
  * first; that fabric is MTU-limited and is not a drop-in for Dragonfly's multi-MiB pieces.
  * Tagged-messaging hints usually filter it already; this walk is defense in depth.
@@ -321,6 +341,9 @@ int dfrdma_mr_close(void *mr)
 int64_t dfrdma_trecv(dfrdma_fabric *f, void *buf, size_t len, void *desc, uint64_t tag,
                      void *context)
 {
+    if (f == NULL || f->ep == NULL) {
+        return -FI_EOPBADSTATE;
+    }
     ssize_t rc = fi_trecv(f->ep, buf, len, desc, FI_ADDR_UNSPEC, tag, 0, context);
     if (rc == -FI_EAGAIN) {
         return 1;
@@ -331,6 +354,9 @@ int64_t dfrdma_trecv(dfrdma_fabric *f, void *buf, size_t len, void *desc, uint64
 int64_t dfrdma_tsend(dfrdma_fabric *f, const void *buf, size_t len, void *desc,
                      uint64_t dest, uint64_t tag, void *context)
 {
+    if (f == NULL || f->ep == NULL) {
+        return -FI_EOPBADSTATE;
+    }
     ssize_t rc = fi_tsend(f->ep, buf, len, desc, (fi_addr_t)dest, tag, context);
     if (rc == -FI_EAGAIN) {
         return 1;
@@ -384,5 +410,11 @@ int dfrdma_cq_read_batch(dfrdma_fabric *f, dfrdma_completion *out, size_t capaci
 
 int dfrdma_cancel(dfrdma_fabric *f, void *context)
 {
-    return (int)fi_cancel(&f->ep->fid, context);
+    if (f == NULL || f->ep == NULL) {
+        return -FI_EOPBADSTATE;
+    }
+    int rc = (int)fi_cancel(&f->ep->fid, context);
+    /* The operation can complete between the Rust pending-map check and fi_cancel. Treat
+     * that race as success; the progress thread will reap the already-queued completion. */
+    return rc == -FI_ENOENT ? 0 : rc;
 }
