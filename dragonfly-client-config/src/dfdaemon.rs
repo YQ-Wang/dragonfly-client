@@ -279,6 +279,21 @@ fn default_storage_server_rdma_chunk_size() -> ByteSize {
     ByteSize::mib(4)
 }
 
+/// default_storage_server_rdma_max_inflight_chunks bounds posted send and receive operations for
+/// one piece. A bounded window avoids exhausting provider queues while retaining enough work to
+/// keep the fabric busy.
+#[inline]
+fn default_storage_server_rdma_max_inflight_chunks() -> u32 {
+    16
+}
+
+/// default_storage_server_rdma_max_concurrent_transfers bounds rendezvous tasks and storage
+/// readers independently of the registered-memory budget.
+#[inline]
+fn default_storage_server_rdma_max_concurrent_transfers() -> u32 {
+    64
+}
+
 /// default_storage_server_rdma_transfer_timeout is the maximum time an RDMA operation may remain
 /// in flight before it is cancelled and the caller falls back to TCP.
 #[inline]
@@ -1056,6 +1071,19 @@ pub struct RdmaServer {
     )]
     pub chunk_size: ByteSize,
 
+    /// Maximum number of tagged chunks posted concurrently for one piece transfer. Peers
+    /// negotiate the lower value. Keeping this bounded prevents a large piece or small chunk size
+    /// from consuming the endpoint's entire transmit or receive queue.
+    #[serde(default = "default_storage_server_rdma_max_inflight_chunks")]
+    #[validate(range(min = 1, max = 4096))]
+    pub max_inflight_chunks: u32,
+
+    /// Maximum number of accepted RDMA rendezvous connections being served concurrently.
+    /// Excess connections are closed immediately so their callers can fall back to TCP.
+    #[serde(default = "default_storage_server_rdma_max_concurrent_transfers")]
+    #[validate(range(min = 1, max = 65535))]
+    pub max_concurrent_transfers: u32,
+
     /// Maximum duration of one fabric operation before cancellation and TCP fallback.
     #[serde(
         default = "default_storage_server_rdma_transfer_timeout",
@@ -1076,6 +1104,8 @@ impl Default for RdmaServer {
             fabric_tag: None,
             max_registered_bytes: default_storage_server_rdma_max_registered_bytes(),
             chunk_size: default_storage_server_rdma_chunk_size(),
+            max_inflight_chunks: default_storage_server_rdma_max_inflight_chunks(),
+            max_concurrent_transfers: default_storage_server_rdma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_rdma_transfer_timeout(),
         }
     }
@@ -2256,6 +2286,8 @@ key: /etc/ssl/private/client.pem
                     "fabricTag": "vpc-123/use1-az1",
                     "maxRegisteredBytes": "1GiB",
                     "chunkSize": "16MiB",
+                    "maxInflightChunks": 8,
+                    "maxConcurrentTransfers": 32,
                     "transferTimeout": "15s"
                 }
             },
@@ -2285,6 +2317,8 @@ key: /etc/ssl/private/client.pem
         );
         assert_eq!(storage.server.rdma.max_registered_bytes, ByteSize::gib(1));
         assert_eq!(storage.server.rdma.chunk_size, ByteSize::mib(16));
+        assert_eq!(storage.server.rdma.max_inflight_chunks, 8);
+        assert_eq!(storage.server.rdma.max_concurrent_transfers, 32);
         assert_eq!(
             storage.server.rdma.transfer_timeout,
             Duration::from_secs(15)
@@ -2308,6 +2342,8 @@ key: /etc/ssl/private/client.pem
         assert!(rdma.fabric_tag.is_none());
         assert_eq!(rdma.max_registered_bytes, ByteSize::mib(512));
         assert_eq!(rdma.chunk_size, ByteSize::mib(4));
+        assert_eq!(rdma.max_inflight_chunks, 16);
+        assert_eq!(rdma.max_concurrent_transfers, 64);
         assert_eq!(rdma.transfer_timeout, Duration::from_secs(10));
     }
 
@@ -2315,6 +2351,36 @@ key: /etc/ssl/private/client.pem
     fn reject_empty_rdma_fabric_tag() {
         let rdma = RdmaServer {
             fabric_tag: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(rdma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_rdma_max_inflight_chunks() {
+        let rdma = RdmaServer {
+            max_inflight_chunks: 0,
+            ..Default::default()
+        };
+        assert!(rdma.validate().is_err());
+
+        let rdma = RdmaServer {
+            max_inflight_chunks: 4097,
+            ..Default::default()
+        };
+        assert!(rdma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_rdma_max_concurrent_transfers() {
+        let rdma = RdmaServer {
+            max_concurrent_transfers: 0,
+            ..Default::default()
+        };
+        assert!(rdma.validate().is_err());
+
+        let rdma = RdmaServer {
+            max_concurrent_transfers: 65536,
             ..Default::default()
         };
         assert!(rdma.validate().is_err());

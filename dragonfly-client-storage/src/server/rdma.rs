@@ -38,7 +38,7 @@ use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpListener, TcpStream,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time;
 use tracing::{debug, error, info, instrument, Span};
 
@@ -161,9 +161,15 @@ impl RDMAServer {
             },
             fabric,
             chunk_size: rdma_config.chunk_size.as_u64(),
+            max_inflight_chunks: rdma_config.max_inflight_chunks,
+            max_registered_bytes: rdma_config.max_registered_bytes.as_u64(),
             transfer_timeout: rdma_config.transfer_timeout,
+            piece_timeout: self.config.download.piece_timeout,
         };
         let handler = Arc::new(handler);
+        let transfer_admission = Arc::new(Semaphore::new(
+            rdma_config.max_concurrent_transfers as usize,
+        ));
 
         let socket = Socket::new(
             Domain::for_address(self.addr),
@@ -202,8 +208,16 @@ impl RDMAServer {
                     let (tcp, remote_address) = tcp_accepted?;
                     debug!("accepted rdma rendezvous connection from {}", remote_address);
 
+                    let Ok(admission) = transfer_admission.clone().try_acquire_owned() else {
+                        debug!(
+                            "rdma rendezvous admission full, closing connection from {}",
+                            remote_address
+                        );
+                        continue;
+                    };
                     let handler = handler.clone();
                     tokio::spawn(async move {
+                        let _admission = admission;
                         if let Err(err) = handler.handle(tcp, remote_address.to_string()).await {
                            error!("failed to serve rdma connection from {}: {}", remote_address, err);
                         }
@@ -240,14 +254,25 @@ struct RDMAServerHandler {
     /// chunk_size is the server's preferred maximum tagged-message size.
     chunk_size: u64,
 
+    /// max_inflight_chunks bounds posted operations and registered staging memory per transfer.
+    max_inflight_chunks: u32,
+
+    /// max_registered_bytes is the fabric-wide registration budget. The sender uses a
+    /// double-buffered ring only when one transfer's ring fits that budget.
+    max_registered_bytes: u64,
+
     /// transfer_timeout bounds each fabric operation and rendezvous wait.
     transfer_timeout: std::time::Duration,
+
+    /// piece_timeout bounds the complete server-side operation, including storage staging and
+    /// registered-memory admission.
+    piece_timeout: std::time::Duration,
 }
 
 /// RDMAServerHandler implements the per-connection transfer flow.
 impl RDMAServerHandler {
-    /// Handles one rendezvous connection: negotiate, load the piece into a pinned buffer,
-    /// wait for the client's receives, send the bytes over the fabric.
+    /// Handles one rendezvous connection: negotiate, stage bounded windows into registered
+    /// memory, wait for the client's receives, and send the bytes over the fabric.
     #[instrument(skip_all, fields(host_id, remote_address, task_id, piece_id))]
     async fn handle(&self, stream: TcpStream, remote_address: String) -> ClientResult<()> {
         let (mut reader, mut writer) = stream.into_split();
@@ -280,15 +305,33 @@ impl RDMAServerHandler {
 
         collect_upload_piece_started_metrics();
         info!("start upload piece content over rdma");
-        match self.handle_piece(&request, &mut reader, &mut writer).await {
-            Ok(length) => {
+        match time::timeout(
+            self.piece_timeout,
+            self.handle_piece(&request, &mut reader, &mut writer),
+        )
+        .await
+        {
+            Ok(Ok(length)) => {
                 collect_upload_piece_finished_metrics();
                 collect_upload_piece_traffic_metrics(length);
                 Ok(())
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 collect_upload_piece_failure_metrics();
                 Err(err)
+            }
+            Err(err) => {
+                collect_upload_piece_failure_metrics();
+                let message = format!(
+                    "rdma piece transfer timed out after {:?}",
+                    self.piece_timeout
+                );
+                let _ = time::timeout(
+                    self.transfer_timeout,
+                    self.abort(&mut writer, ERROR_CODE_INTERNAL, message),
+                )
+                .await;
+                Err(err.into())
             }
         }
     }
@@ -332,14 +375,25 @@ impl RDMAServerHandler {
             .chunk_size
             .min(self.chunk_size)
             .min(self.fabric.max_msg_size() as u64);
-        if piece.length == 0 || chunk_size == 0 {
+        let max_inflight_chunks = request.max_inflight_chunks.min(self.max_inflight_chunks);
+        if piece.length == 0
+            || chunk_size == 0
+            || max_inflight_chunks == 0
+            || u64::from(max_inflight_chunks) > MAX_CHUNKS
+        {
             self.abort(
                 writer,
                 ERROR_CODE_INTERNAL,
-                format!("piece {} has invalid length {}", piece_id, piece.length),
+                format!(
+                    "piece {} has invalid transfer parameters: length {}, chunk size {}, \
+                     inflight chunks {}",
+                    piece_id, piece.length, chunk_size, max_inflight_chunks
+                ),
             )
             .await?;
-            return Err(ClientError::Unknown("invalid piece length".to_string()));
+            return Err(ClientError::Unknown(
+                "invalid rdma transfer parameters".to_string(),
+            ));
         }
         let chunk_count = piece.length.div_ceil(chunk_size);
         if chunk_count > MAX_CHUNKS {
@@ -351,21 +405,51 @@ impl RDMAServerHandler {
             .await?;
             return Err(ClientError::Unknown("piece too large for rdma".to_string()));
         }
+        if request
+            .tag
+            .checked_add(chunk_count.saturating_sub(1))
+            .is_none()
+        {
+            self.abort(
+                writer,
+                ERROR_CODE_INTERNAL,
+                "rdma transfer tag range wraps around".to_string(),
+            )
+            .await?;
+            return Err(ClientError::Unknown(
+                "rdma transfer tag range wraps around".to_string(),
+            ));
+        }
+        let piece_length = match usize::try_from(piece.length) {
+            Ok(length) => length,
+            Err(_) => {
+                self.abort(
+                    writer,
+                    ERROR_CODE_TOO_LARGE,
+                    "piece exceeds addressable memory".to_string(),
+                )
+                .await?;
+                return Err(ClientError::Unknown(
+                    "piece exceeds addressable memory".to_string(),
+                ));
+            }
+        };
 
-        // Acquire the upload bandwidth limiter, matching the TCP server.
-        self.upload_bandwidth_limiter
-            .acquire(piece.length as usize)
-            .await;
-
-        // Load the piece content into a pinned send buffer.
-        let mut buf = match self.fabric.acquire_buffer(piece.length as usize).await {
-            Ok(buf) => buf,
+        // Resolve the downloader's fabric address before consuming upload-bandwidth tokens or
+        // promising readiness. Invalid provider addresses fail without throttling legitimate
+        // transfers.
+        let dest = match self.fabric.resolve(&request.client_endpoint) {
+            Ok(dest) => dest,
             Err(err) => {
-                self.abort(writer, ERROR_CODE_TOO_LARGE, err.to_string())
+                self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
                     .await?;
                 return Err(err);
             }
         };
+
+        // Acquire the upload bandwidth limiter, matching the TCP server.
+        self.upload_bandwidth_limiter.acquire(piece_length).await;
+
         let content_reader: ClientResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> =
             match request.kind {
                 PieceKind::Piece => self
@@ -392,23 +476,52 @@ impl RDMAServerHandler {
                 return Err(err);
             }
         };
-        // Safety: no operation over this buffer has been posted yet.
-        let content = unsafe { buf.as_mut_slice() };
-        if let Err(err) = content_reader.read_exact(content).await {
-            self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
-                .await?;
-            return Err(err.into());
-        }
 
-        // Resolve the downloader's fabric address before promising readiness.
-        let dest = match self.fabric.resolve(&request.client_endpoint) {
-            Ok(dest) => dest,
+        // Use a two-window registered ring when the piece spans multiple windows. While the NIC
+        // sends one half, the storage reader fills the other. A one-window piece still allocates
+        // only its logical length.
+        let window_capacity = piece
+            .length
+            .min(chunk_size.saturating_mul(u64::from(max_inflight_chunks)));
+        let ring_windows = if piece.length > window_capacity
+            && window_capacity.saturating_mul(2) <= self.max_registered_bytes
+        {
+            2
+        } else {
+            1
+        };
+        let staging_length = piece
+            .length
+            .min(window_capacity.saturating_mul(ring_windows));
+        let window_capacity = usize::try_from(window_capacity).map_err(|_| {
+            ClientError::Unknown("rdma staging window exceeds addressable memory".to_string())
+        })?;
+        let staging_length = usize::try_from(staging_length).map_err(|_| {
+            ClientError::Unknown("rdma staging ring exceeds addressable memory".to_string())
+        })?;
+        let mut buf = match self.fabric.acquire_buffer(staging_length).await {
+            Ok(buf) => buf,
             Err(err) => {
-                self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                self.abort(writer, ERROR_CODE_TOO_LARGE, err.to_string())
                     .await?;
                 return Err(err);
             }
         };
+
+        let first_window_count = chunk_count.min(u64::from(max_inflight_chunks)) as u32;
+        let first_window_end = piece
+            .length
+            .min(u64::from(first_window_count).saturating_mul(chunk_size));
+        let first_window_length = usize::try_from(first_window_end).map_err(|_| {
+            ClientError::Unknown("rdma staging window exceeds addressable memory".to_string())
+        })?;
+        // Safety: no fabric operation has been posted over the staging ring.
+        let first_window = unsafe { &mut buf.as_mut_slice()[..first_window_length] };
+        if let Err(err) = content_reader.read_exact(first_window).await {
+            self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                .await?;
+            return Err(err.into());
+        }
 
         write_frame(
             writer,
@@ -418,41 +531,124 @@ impl RDMAServerHandler {
                 digest: piece.digest.clone(),
                 server_endpoint: self.fabric.local_endpoint().to_vec(),
                 chunk_size,
+                max_inflight_chunks,
             }),
         )
         .await?;
 
-        // The client must post all receives before we send (rendezvous ordering for EFA).
-        match time::timeout(self.transfer_timeout, read_frame(reader)).await? {
-            Ok(Frame::RecvPosted) => {}
-            Ok(frame) => {
-                return Err(ClientError::Unknown(format!(
-                    "unexpected rendezvous frame: {:?}",
-                    frame
-                )));
+        let mut start_chunk = 0;
+        let mut window_index = 0usize;
+        while start_chunk < chunk_count {
+            let window_count =
+                (chunk_count - start_chunk).min(u64::from(max_inflight_chunks)) as u32;
+            match time::timeout(self.transfer_timeout, read_frame(reader)).await? {
+                Ok(Frame::RecvPosted {
+                    start_chunk: posted_start,
+                    chunk_count: posted_count,
+                }) if posted_start == start_chunk && posted_count == window_count => {}
+                Ok(frame) => {
+                    let message = format!(
+                        "invalid rdma receive window at chunk {}: {:?}",
+                        start_chunk, frame
+                    );
+                    self.abort(writer, ERROR_CODE_INTERNAL, message.clone())
+                        .await?;
+                    return Err(ClientError::Unknown(message));
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
-        }
 
-        // The pooled lease remains alive until every send completion is reaped.
-        let mut ops = Vec::with_capacity(chunk_count as usize);
-        for chunk in 0..chunk_count {
-            let offset = chunk * chunk_size;
-            let len = chunk_size.min(piece.length - offset);
-            ops.push(
-                self.fabric
-                    .post_send(
-                        buf.buffer(),
-                        offset as usize,
-                        len as usize,
-                        request.tag.wrapping_add(chunk),
-                        dest,
-                    )
-                    .await?,
-            );
-        }
-        for op in ops {
-            self.fabric.wait(op, self.transfer_timeout).await?;
+            let buffer_offset = (window_index % ring_windows as usize) * window_capacity;
+            let send_buffer = buf.buffer().clone();
+            let send_window = async {
+                let mut ops = Vec::with_capacity(window_count as usize);
+                for chunk in start_chunk..start_chunk + u64::from(window_count) {
+                    let piece_offset = chunk * chunk_size;
+                    let offset_in_window = piece_offset - start_chunk * chunk_size;
+                    let len = chunk_size.min(piece.length - piece_offset);
+                    ops.push(
+                        self.fabric
+                            .post_send(
+                                &send_buffer,
+                                buffer_offset + offset_in_window as usize,
+                                len as usize,
+                                request.tag + chunk,
+                                dest,
+                            )
+                            .await?,
+                    );
+                }
+                for op in ops {
+                    self.fabric.wait(op, self.transfer_timeout).await?;
+                }
+                ClientResult::Ok(())
+            };
+
+            let next_start_chunk = start_chunk + u64::from(window_count);
+            if next_start_chunk < chunk_count {
+                let next_window_count =
+                    (chunk_count - next_start_chunk).min(u64::from(max_inflight_chunks)) as u32;
+                let next_window_offset =
+                    ((window_index + 1) % ring_windows as usize) * window_capacity;
+                let next_piece_offset = next_start_chunk * chunk_size;
+                let next_piece_end = piece.length.min(
+                    (next_start_chunk + u64::from(next_window_count)).saturating_mul(chunk_size),
+                );
+                let next_window_length = usize::try_from(next_piece_end - next_piece_offset)
+                    .map_err(|_| {
+                        ClientError::Unknown(
+                            "rdma staging window exceeds addressable memory".to_string(),
+                        )
+                    })?;
+                let read_result = if ring_windows == 2 {
+                    // Safety: this half of the ring is disjoint from the window currently
+                    // visible to the provider. Its previous send, if any, completed two
+                    // iterations earlier.
+                    let next_window = unsafe {
+                        buf.as_mut_range(
+                            next_window_offset..next_window_offset + next_window_length,
+                        )
+                    };
+                    let read_window = async {
+                        content_reader
+                            .read_exact(next_window)
+                            .await
+                            .map(|_| ())
+                            .map_err(ClientError::from)
+                    };
+                    if let Err(err) = tokio::try_join!(send_window, read_window) {
+                        self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                            .await?;
+                        return Err(err);
+                    }
+                    Ok(0)
+                } else {
+                    // With only one window of registration budget, wait for its sends before
+                    // safely refilling the same prefix.
+                    if let Err(err) = send_window.await {
+                        self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                            .await?;
+                        return Err(err);
+                    }
+                    // Safety: every send over the single window completed above.
+                    let next_window = unsafe { &mut buf.as_mut_slice()[..next_window_length] };
+                    content_reader.read_exact(next_window).await
+                };
+                if let Err(err) = read_result {
+                    self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                        .await?;
+                    return Err(err.into());
+                }
+            } else {
+                if let Err(err) = send_window.await {
+                    self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                        .await?;
+                    return Err(err);
+                }
+            }
+
+            start_chunk = next_start_chunk;
+            window_index += 1;
         }
 
         write_frame(writer, &Frame::Done).await?;

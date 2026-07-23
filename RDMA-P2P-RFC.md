@@ -94,20 +94,28 @@ Parent -> client              : Capability | Error
 
 Client -> RDMA rendezvous : Request {
                               kind, task_id, piece_number, capability,
-                              client_endpoint, tag, chunk_size
+                              client_endpoint, tag, chunk_size,
+                              max_inflight_chunks
                             }
 Parent -> client          : Ready {
                               offset, length, digest,
-                              server_endpoint, chunk_size
+                              server_endpoint, chunk_size,
+                              max_inflight_chunks
                             } | Error
-Client -> parent          : RecvPosted
-       ... fi_tsend/fi_trecv transfer the piece bytes ...
+Client -> parent          : RecvPosted { start_chunk, chunk_count }
+       ... fi_tsend/fi_trecv transfer one bounded window ...
+       ... repeat RecvPosted and transfer until complete ...
 Parent -> client          : Done
 ```
 
-The client posts all tagged receives before sending `RecvPosted`. This avoids depending on finite
-EFA unexpected-message resources. The parent then posts tagged sends, and both sides reap
-completion-queue entries in batches.
+Rendezvous protocol v2 negotiates the lower `max_inflight_chunks` value. The client posts one
+contiguous receive window before sending `RecvPosted`, which avoids depending on finite EFA
+unexpected-message resources without attempting to consume the provider's entire posted-receive
+queue. The parent validates the next expected window, stages that window into a reusable registered
+two-window ring, and fills the next half from storage while the current half is sent. It reaps every
+completion before reusing a half. When two windows do not fit the registration budget, the parent
+sequentially reuses one window. The client retains one completed piece lease so an RDMA failure
+remains eligible for TCP fallback before downstream storage mutation.
 
 This is intentionally not Vortex TLV over RDMA. The application-level piece operations and result
 contract remain unchanged, while the RDMA-specific endpoint and receive-before-send coordination
@@ -148,18 +156,25 @@ storage:
       fabricTag: vpc-0123/use1-az1
       maxRegisteredBytes: 512MiB
       chunkSize: 4MiB
+      maxInflightChunks: 16
+      maxConcurrentTransfers: 64
       transferTimeout: 10s
 ```
 
 Defaults remain safe: `download.protocol` is `tcp`, RDMA serving is disabled, software providers
 are disallowed, the transfer-buffer budget is 512 MiB, the preferred chunk size is 4 MiB, and the
-per-operation timeout is 10 seconds.
+server admits at most 64 concurrent RDMA rendezvous transfers. The per-operation timeout is 10
+seconds.
 
 A receive-only daemon may leave `enable: false`; it still needs a non-empty `fabricTag` and usable
 provider/device settings when `download.protocol` is `rdma`. Discovery advertises the parent's
 actual rendezvous port, so ports need not be fleet-uniform.
 
 `transferTimeout` bounds individual fabric operations and rendezvous waits.
+`maxInflightChunks` bounds the posted send/receive operations and sender staging memory for one
+piece. Peers negotiate the lower value.
+`maxConcurrentTransfers` bounds accepted RDMA rendezvous tasks and storage readers; excess
+connections are closed so the downloader immediately falls back to TCP.
 `download.pieceTimeout` independently bounds the complete piece download.
 
 ## 5. Correctness and safety
@@ -180,6 +195,9 @@ and idle pooled transfer buffers and their registrations. On a miss, undersized 
 evicted before waiting for new budget, preventing cached registrations from starving larger
 requests.
 
+The process-shared provider address-vector cache is also bounded; new unique endpoint addresses
+fail closed after the cap instead of growing process and provider state indefinitely.
+
 Pool counters are available in-process but are not yet exported as production metrics.
 
 ### Concurrency
@@ -193,8 +211,9 @@ sleeps briefly while operations are pending, and uses a longer sleep while idle.
 
 ### Tags and bounds
 
-A transfer base tag is derived from a process-local counter and randomized hash seed. Chunks use
-consecutive tags from that base. Collisions are improbable rather than mathematically impossible.
+A process-local allocator reserves a disjoint block of 4,096 tags per transfer. Chunks use
+consecutive tags from that base, and allocator exhaustion fails closed instead of wrapping into an
+in-flight block.
 
 Transfers are capped at 4,096 chunks. Peers negotiate the lower configured chunk size and provider
 maximum.
@@ -263,7 +282,8 @@ still needs:
 Current performance limitations:
 
 - one domain per `Fabric`, with no striping across the eight EFA devices;
-- host bounce buffers rather than content-store mmap or GPU memory;
+- a two-window sender ring but a whole-piece registered receive lease rather than an end-to-end
+  streaming ring, content-store mmap, or GPU memory;
 - one TCP rendezvous connection per piece; and
 - no one-sided RMA or `FI_HMEM`.
 

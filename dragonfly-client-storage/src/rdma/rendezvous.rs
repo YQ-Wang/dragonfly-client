@@ -36,7 +36,7 @@ pub const MAGIC: u32 = 0x4446_5244;
 
 /// VERSION is the rendezvous wire-contract version. Peers with different versions must
 /// fall back to TCP.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// MAX_TASK_ID_LENGTH caps the task id field.
 const MAX_TASK_ID_LENGTH: usize = 4096;
@@ -195,6 +195,9 @@ pub struct PieceRequest {
 
     /// chunk_size is the largest single fabric message the downloader accepts.
     pub chunk_size: u64,
+
+    /// max_inflight_chunks is the maximum number of receives the downloader posts at once.
+    pub max_inflight_chunks: u32,
 }
 
 /// PieceReady tells the downloader the parent is ready to send the piece.
@@ -214,6 +217,9 @@ pub struct PieceReady {
 
     /// chunk_size is the negotiated fabric message size (min of both sides).
     pub chunk_size: u64,
+
+    /// max_inflight_chunks is the negotiated operation window (min of both sides).
+    pub max_inflight_chunks: u32,
 }
 
 /// RendezvousError reports a failure over the rendezvous channel.
@@ -241,10 +247,15 @@ pub enum Frame {
     /// Ready reports piece metadata and the parent endpoint (parent to client).
     Ready(PieceReady),
 
-    /// RecvPosted signals all receives are posted (client to parent). The parent must not
-    /// send fabric messages before this arrives (EFA has limited unexpected-message
-    /// buffering).
-    RecvPosted,
+    /// RecvPosted grants permission to send one contiguous chunk window. The parent must not
+    /// send the window before this arrives (EFA has limited unexpected-message buffering).
+    RecvPosted {
+        /// start_chunk is the zero-based first chunk in the posted window.
+        start_chunk: u64,
+
+        /// chunk_count is the number of contiguous posted receives.
+        chunk_count: u32,
+    },
 
     /// Done signals all fabric sends completed (parent to client).
     Done,
@@ -261,7 +272,7 @@ impl Frame {
             Frame::Capability(_) => 7,
             Frame::Request(_) => 1,
             Frame::Ready(_) => 2,
-            Frame::RecvPosted => 3,
+            Frame::RecvPosted { .. } => 3,
             Frame::Done => 4,
             Frame::Error(_) => 5,
         }
@@ -344,6 +355,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
             put_bytes(&mut payload, &request.client_endpoint);
             payload.extend_from_slice(&request.tag.to_be_bytes());
             payload.extend_from_slice(&request.chunk_size.to_be_bytes());
+            payload.extend_from_slice(&request.max_inflight_chunks.to_be_bytes());
         }
         Frame::Ready(ready) => {
             payload.extend_from_slice(&ready.offset.to_be_bytes());
@@ -351,8 +363,16 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
             put_bytes(&mut payload, ready.digest.as_bytes());
             put_bytes(&mut payload, &ready.server_endpoint);
             payload.extend_from_slice(&ready.chunk_size.to_be_bytes());
+            payload.extend_from_slice(&ready.max_inflight_chunks.to_be_bytes());
         }
-        Frame::RecvPosted | Frame::Done => {}
+        Frame::RecvPosted {
+            start_chunk,
+            chunk_count,
+        } => {
+            payload.extend_from_slice(&start_chunk.to_be_bytes());
+            payload.extend_from_slice(&chunk_count.to_be_bytes());
+        }
+        Frame::Done => {}
         Frame::Error(error) => {
             payload.extend_from_slice(&error.code.to_be_bytes());
             put_bytes(&mut payload, error.message.as_bytes());
@@ -403,8 +423,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
     reader.read_exact(&mut payload).await?;
     let mut reader = Reader { buf: &payload };
 
-    match frame_type {
-        1 => Ok(Frame::Request(PieceRequest {
+    let frame = match frame_type {
+        1 => Frame::Request(PieceRequest {
             kind: reader.u8()?.try_into()?,
             task_id: reader.string(MAX_TASK_ID_LENGTH)?,
             piece_number: reader.u32()?,
@@ -415,33 +435,47 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
             client_endpoint: reader.bytes(MAX_ENDPOINT_LENGTH)?,
             tag: reader.u64()?,
             chunk_size: reader.u64()?,
-        })),
-        2 => Ok(Frame::Ready(PieceReady {
+            max_inflight_chunks: reader.u32()?,
+        }),
+        2 => Frame::Ready(PieceReady {
             offset: reader.u64()?,
             length: reader.u64()?,
             digest: reader.string(MAX_STRING_LENGTH)?,
             server_endpoint: reader.bytes(MAX_ENDPOINT_LENGTH)?,
             chunk_size: reader.u64()?,
-        })),
-        3 => Ok(Frame::RecvPosted),
-        4 => Ok(Frame::Done),
-        5 => Ok(Frame::Error(RendezvousError {
+            max_inflight_chunks: reader.u32()?,
+        }),
+        3 => Frame::RecvPosted {
+            start_chunk: reader.u64()?,
+            chunk_count: reader.u32()?,
+        },
+        4 => Frame::Done,
+        5 => Frame::Error(RendezvousError {
             code: reader.u32()?,
             message: reader.string(MAX_STRING_LENGTH)?,
-        })),
-        6 => Ok(Frame::Discover),
-        7 => Ok(Frame::Capability(RdmaAdvertisement {
+        }),
+        6 => Frame::Discover,
+        7 => Frame::Capability(RdmaAdvertisement {
             capability: WireCapability {
                 provider: reader.string(MAX_STRING_LENGTH)?,
                 fabric_tag: reader.string(MAX_STRING_LENGTH)?,
             },
             port: u16::from_be_bytes(reader.take(2)?.try_into().unwrap()),
-        })),
-        _ => Err(Error::Unknown(format!(
-            "unknown rendezvous frame type: {}",
-            frame_type
-        ))),
+        }),
+        _ => {
+            return Err(Error::Unknown(format!(
+                "unknown rendezvous frame type: {}",
+                frame_type
+            )));
+        }
+    };
+    if !reader.buf.is_empty() {
+        return Err(Error::Unknown(format!(
+            "rendezvous frame has {} trailing payload bytes",
+            reader.buf.len()
+        )));
     }
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -479,6 +513,7 @@ mod tests {
             client_endpoint: vec![1, 2, 3, 4],
             tag: 0xdead_beef_dead_beef,
             chunk_size: 4 * 1024 * 1024,
+            max_inflight_chunks: 16,
         });
         assert_eq!(roundtrip(request.clone()).await, request);
 
@@ -488,10 +523,15 @@ mod tests {
             digest: "crc32:12345678".to_string(),
             server_endpoint: vec![9, 8, 7],
             chunk_size: 1024 * 1024,
+            max_inflight_chunks: 8,
         });
         assert_eq!(roundtrip(ready.clone()).await, ready);
 
-        assert_eq!(roundtrip(Frame::RecvPosted).await, Frame::RecvPosted);
+        let recv_posted = Frame::RecvPosted {
+            start_chunk: 32,
+            chunk_count: 8,
+        };
+        assert_eq!(roundtrip(recv_posted.clone()).await, recv_posted);
         assert_eq!(roundtrip(Frame::Done).await, Frame::Done);
 
         let error = Frame::Error(RendezvousError {
@@ -528,6 +568,21 @@ mod tests {
         header.extend_from_slice(&(MAX_PAYLOAD_LENGTH as u32 + 1).to_be_bytes());
         client.write_all(&header).await.unwrap();
         assert!(read_frame(&mut server).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_trailing_payload_bytes() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC.to_be_bytes());
+        frame.push(VERSION);
+        frame.push(Frame::Done.frame_type());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.push(0xff);
+        client.write_all(&frame).await.unwrap();
+
+        let err = read_frame(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("trailing payload"));
     }
 
     #[test]

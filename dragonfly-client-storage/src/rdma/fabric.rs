@@ -35,7 +35,6 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
-use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -121,6 +120,14 @@ mod ffi {
 
 /// BUDGET_UNIT is the granularity of the registered-memory budget semaphore.
 const BUDGET_UNIT: u64 = 64 * 1024;
+
+/// TAG_RANGE_SIZE reserves one disjoint tag block per transfer. A transfer uses its base
+/// tag plus at most TAG_RANGE_SIZE - 1 chunk indices.
+pub(crate) const TAG_RANGE_SIZE: u64 = 4096;
+
+/// MAX_RESOLVED_PEERS bounds provider address-vector and process memory growth caused by
+/// resolving a stream of unique endpoint addresses.
+const MAX_RESOLVED_PEERS: usize = 65_536;
 
 /// POST_RETRY_INTERVAL is the pause between retries when a transmit or receive queue is
 /// full (FI_EAGAIN).
@@ -429,6 +436,17 @@ impl PinnedBuf {
         (*self.data.get()).as_mut_slice()
     }
 
+    /// as_mut_range exposes one mutable subrange for pipelined filling.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no fabric operation or other CPU reference currently accesses
+    /// any byte in `range`.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn as_mut_range(&self, range: std::ops::Range<usize>) -> &mut [u8] {
+        &mut (*self.data.get()).as_mut_slice()[range]
+    }
+
     /// ptr returns a raw pointer to the byte at `offset`.
     fn ptr(&self, offset: usize) -> *mut u8 {
         // Safety: offset is validated by the posting functions.
@@ -598,6 +616,17 @@ impl PooledBuf {
         &mut self.buffer().as_mut_slice()[..self.logical_len]
     }
 
+    /// as_mut_range exposes one transfer-visible subrange for pipelined filling.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no fabric operation or other CPU reference currently accesses
+    /// any byte in `range`.
+    pub(crate) unsafe fn as_mut_range(&mut self, range: std::ops::Range<usize>) -> &mut [u8] {
+        assert!(range.start <= range.end && range.end <= self.logical_len);
+        self.buffer().as_mut_range(range)
+    }
+
     /// into_reader turns a completed receive lease into an async reader without moving or
     /// copying its registered allocation.
     pub fn into_reader(self) -> PooledBufReader {
@@ -721,12 +750,8 @@ pub struct Fabric {
     /// pool retains idle registrations for best-fit reuse.
     pool: Arc<BufferPool>,
 
-    /// tag_counter feeds unique transfer tags.
+    /// tag_counter is the first unallocated transfer-tag block.
     tag_counter: AtomicU64,
-
-    /// tag_hasher randomizes transfer tags so concurrent transfers cannot collide by
-    /// accident and tags are not guessable across processes.
-    tag_hasher: RandomState,
 }
 
 impl Fabric {
@@ -854,7 +879,6 @@ impl Fabric {
             budget_permits,
             pool: Arc::new(BufferPool::new()),
             tag_counter: AtomicU64::new(0),
-            tag_hasher: RandomState::new(),
         })
     }
 
@@ -884,14 +908,14 @@ impl Fabric {
         self.pool.stats()
     }
 
-    /// next_tag derives a pseudo-random transfer base tag from a process-local counter and
-    /// randomized hash seed. Each chunk uses a consecutive tag from this base; collisions are
-    /// improbable rather than mathematically impossible.
-    pub fn next_tag(&self) -> u64 {
-        let counter = self.tag_counter.fetch_add(1, Ordering::Relaxed);
-        let mut hasher = self.tag_hasher.build_hasher();
-        hasher.write_u64(counter);
-        hasher.finish()
+    /// next_tag reserves a disjoint block of tags for one transfer. Exhaustion fails closed
+    /// instead of wrapping into a block that may still belong to an in-flight transfer.
+    pub fn next_tag(&self) -> Result<u64> {
+        self.tag_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(TAG_RANGE_SIZE)
+            })
+            .map_err(|_| Error::Unknown("rdma transfer tag space exhausted".to_string()))
     }
 
     /// alloc_buffer allocates a transfer buffer of `len` bytes, waits for registered-memory
@@ -1035,6 +1059,9 @@ impl Fabric {
     /// fabric address. Results are cached.
     pub fn resolve(&self, endpoint: &[u8]) -> Result<u64> {
         self.inner.ensure_healthy()?;
+        if endpoint.is_empty() {
+            return Err(Error::InvalidParameter);
+        }
         let _lifecycle = self.inner.handle.endpoint_lifecycle.read().unwrap();
         if !self.inner.handle.endpoint_open.load(Ordering::Acquire) {
             return Err(Error::Unknown("rdma endpoint is closed".to_string()));
@@ -1043,6 +1070,11 @@ impl Fabric {
         let mut av = self.inner.av.lock().unwrap();
         if let Some(addr) = av.get(endpoint) {
             return Ok(*addr);
+        }
+        if av.len() >= MAX_RESOLVED_PEERS {
+            return Err(Error::Unknown(
+                "rdma resolved-peer address cache is full".to_string(),
+            ));
         }
 
         let mut addr: u64 = 0;
@@ -1350,6 +1382,21 @@ mod tests {
     }
 
     #[test]
+    fn allocates_disjoint_transfer_tag_ranges_and_fails_on_exhaustion() {
+        let fabric = open_fabric();
+        let first = fabric.next_tag().unwrap();
+        let second = fabric.next_tag().unwrap();
+        assert_eq!(second - first, TAG_RANGE_SIZE);
+        assert!(first + TAG_RANGE_SIZE - 1 < second);
+
+        fabric
+            .tag_counter
+            .store(u64::MAX - TAG_RANGE_SIZE + 1, Ordering::Relaxed);
+        let err = fabric.next_tag().unwrap_err();
+        assert!(err.to_string().contains("tag space exhausted"));
+    }
+
+    #[test]
     fn automatic_provider_never_silently_selects_software() {
         if let Ok(fabric) = Fabric::new(None, None, 64 * 1024 * 1024, false) {
             assert!(
@@ -1371,7 +1418,7 @@ mod tests {
         let length: usize = 10 * 1024 * 1024;
         let chunk_size: usize = (4 * 1024 * 1024).min(sender.max_msg_size());
         let payload: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
-        let tag = sender.next_tag();
+        let tag = sender.next_tag().unwrap();
 
         let send_buf = sender.alloc_buffer(length).await.unwrap();
         // Safety: nothing is posted over the buffer yet.
@@ -1387,7 +1434,7 @@ mod tests {
             recv_ops.push((
                 len,
                 receiver
-                    .post_recv(&recv_buf, offset, len, tag.wrapping_add(chunk))
+                    .post_recv(&recv_buf, offset, len, tag + chunk)
                     .await
                     .unwrap(),
             ));
@@ -1403,7 +1450,7 @@ mod tests {
             let len = chunk_size.min(length - offset);
             send_ops.push(
                 sender
-                    .post_send(&send_buf, offset, len, tag.wrapping_add(chunk), dest)
+                    .post_send(&send_buf, offset, len, tag + chunk, dest)
                     .await
                     .unwrap(),
             );
@@ -1428,7 +1475,7 @@ mod tests {
         let fabric = open_fabric();
         let buf = fabric.alloc_buffer(4096).await.unwrap();
         let op = fabric
-            .post_recv(&buf, 0, 4096, fabric.next_tag())
+            .post_recv(&buf, 0, 4096, fabric.next_tag().unwrap())
             .await
             .unwrap();
         assert_eq!(fabric.inner.pending.lock().unwrap().len(), 1);
@@ -1539,7 +1586,7 @@ mod tests {
         let fabric = open_fabric();
         let buffer = fabric.acquire_buffer(4096).await.unwrap();
         let op = fabric
-            .post_recv(buffer.buffer(), 0, 4096, fabric.next_tag())
+            .post_recv(buffer.buffer(), 0, 4096, fabric.next_tag().unwrap())
             .await
             .unwrap();
         drop(buffer);

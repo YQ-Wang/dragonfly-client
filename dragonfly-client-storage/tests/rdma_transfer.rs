@@ -25,7 +25,10 @@ use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::Error;
 use dragonfly_client_storage::client::rdma::{discover, RDMAClient};
 use dragonfly_client_storage::rdma::fabric::Fabric;
-use dragonfly_client_storage::rdma::rendezvous::{CapabilityRegistry, WireCapability};
+use dragonfly_client_storage::rdma::rendezvous::{
+    read_frame, write_frame, CapabilityRegistry, Frame, PieceKind, PieceReady, PieceRequest,
+    RendezvousError, WireCapability, ERROR_CODE_INTERNAL,
+};
 use dragonfly_client_storage::server::{rdma::RDMAServer, tcp::TCPServer};
 use dragonfly_client_storage::Storage;
 use dragonfly_client_util::{id_generator::IDGenerator, shutdown};
@@ -35,6 +38,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 /// FABRIC_TAG is the shared reachability-domain label for this in-process test pair.
@@ -90,6 +94,93 @@ async fn write_piece(storage: &Storage, task_id: &str, number: u32, content: &[u
             &mut Cursor::new(content.to_vec()),
             Duration::from_secs(10),
         )
+        .await
+        .unwrap();
+    piece.digest
+}
+
+/// write_persistent_piece stores one finished persistent-task piece and returns its digest.
+async fn write_persistent_piece(
+    storage: &Storage,
+    task_id: &str,
+    number: u32,
+    content: &[u8],
+) -> String {
+    storage
+        .create_persistent_task_started(
+            task_id,
+            Duration::from_secs(3600),
+            content.len() as u64,
+            content.len() as u64,
+        )
+        .await
+        .unwrap();
+    storage
+        .create_persistent_task(task_id, content.len() as u64)
+        .await
+        .unwrap();
+    let piece_id = storage.persistent_piece_id(task_id, number);
+    storage
+        .download_persistent_piece_started(&piece_id, number)
+        .await
+        .unwrap();
+    let piece = storage
+        .download_persistent_piece_from_source_finished(
+            &piece_id,
+            task_id,
+            0,
+            content.len() as u64,
+            &mut Cursor::new(content.to_vec()),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    storage
+        .create_persistent_task_finished(task_id)
+        .await
+        .unwrap();
+    piece.digest
+}
+
+/// write_persistent_cache_piece stores one finished persistent-cache piece and returns its digest.
+async fn write_persistent_cache_piece(
+    storage: &Storage,
+    task_id: &str,
+    number: u32,
+    content: &[u8],
+) -> String {
+    storage
+        .create_persistent_cache_task_started(
+            task_id,
+            Duration::from_secs(3600),
+            content.len() as u64,
+            content.len() as u64,
+        )
+        .await
+        .unwrap();
+    storage
+        .create_persistent_cache_task(task_id, content.len() as u64)
+        .await
+        .unwrap();
+    let piece_id = storage.persistent_cache_piece_id(task_id, number);
+    storage
+        .download_persistent_cache_piece_started(&piece_id, number)
+        .await
+        .unwrap();
+    let piece = storage
+        .download_persistent_cache_piece_from_parent_finished(
+            &piece_id,
+            task_id,
+            0,
+            content.len() as u64,
+            "",
+            "fixture-parent",
+            &mut Cursor::new(content.to_vec()),
+        )
+        .await
+        .unwrap();
+    storage
+        .create_persistent_cache_task_finished(task_id)
         .await
         .unwrap();
     piece.digest
@@ -198,8 +289,8 @@ async fn downloads_piece_over_rdma() {
         .unwrap(),
     );
 
-    // 10 MiB piece: the client requests 1 MiB chunks while the server permits the default
-    // 4 MiB, exercising lower-value negotiation across ten fabric messages.
+    // 10 MiB piece: the client requests 1 MiB chunks and a two-chunk operation window while the
+    // server permits larger defaults, exercising negotiation and five consecutive windows.
     let task_id = "b969ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
     let content: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 249) as u8).collect();
     let digest = write_piece(&storage, task_id, 0, &content).await;
@@ -213,6 +304,7 @@ async fn downloads_piece_over_rdma() {
     assert!(capability.compatible(&advertisement.capability).is_ok());
     let mut client_config = config.as_ref().clone();
     client_config.storage.server.rdma.chunk_size = bytesize::ByteSize::mib(1);
+    client_config.storage.server.rdma.max_inflight_chunks = 2;
     let client = RDMAClient::new(
         Arc::new(client_config),
         fabric.clone(),
@@ -233,6 +325,155 @@ async fn downloads_piece_over_rdma() {
     assert_eq!(stats.misses, 1);
     assert_eq!(stats.hits, 1);
     assert_eq!(stats.cached_buffers, 1);
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_persistent_namespaces_over_rdma() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    config.storage.server.rdma.chunk_size = bytesize::ByteSize::kib(4);
+    config.storage.server.rdma.max_inflight_chunks = 2;
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let persistent_task_id = "9269ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    let persistent_cache_task_id =
+        "9369ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    let persistent_content: Vec<u8> = (0..12_345).map(|index| (index % 239) as u8).collect();
+    let persistent_cache_content: Vec<u8> = (0..15_432).map(|index| (index % 233) as u8).collect();
+    let persistent_digest =
+        write_persistent_piece(&storage, persistent_task_id, 0, &persistent_content).await;
+    let persistent_cache_digest = write_persistent_cache_piece(
+        &storage,
+        persistent_cache_task_id,
+        0,
+        &persistent_cache_content,
+    )
+    .await;
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) =
+        start_server(config.clone(), storage).await;
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let client = RDMAClient::new(config, fabric, capability, addr);
+
+    let (mut reader, offset, digest) = client
+        .download_persistent_piece(0, persistent_task_id)
+        .await
+        .unwrap();
+    let mut downloaded = Vec::new();
+    reader.read_to_end(&mut downloaded).await.unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(digest, persistent_digest);
+    assert_eq!(downloaded, persistent_content);
+
+    let (mut reader, offset, digest) = client
+        .download_persistent_cache_piece(0, persistent_cache_task_id)
+        .await
+        .unwrap();
+    let mut downloaded = Vec::new();
+    reader.read_to_end(&mut downloaded).await.unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(digest, persistent_cache_digest);
+    assert_eq!(downloaded, persistent_cache_content);
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_piece_with_single_window_registration_budget() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    // A two-window ring would need 4 MiB with the client settings below. Restricting the server
+    // to 2 MiB exercises safe sequential reuse of one registered window.
+    config.storage.server.rdma.max_registered_bytes = bytesize::ByteSize::mib(2);
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let task_id = "a169ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    let content = vec![0x7c; 5 * 1024 * 1024];
+    let digest = write_piece(&storage, task_id, 0, &content).await;
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) =
+        start_server(config.clone(), storage).await;
+
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let mut client_config = config.as_ref().clone();
+    client_config.storage.server.rdma.chunk_size = bytesize::ByteSize::mib(1);
+    client_config.storage.server.rdma.max_inflight_chunks = 2;
+    let client = RDMAClient::new(Arc::new(client_config), fabric, capability, addr);
+    let (mut reader, offset, got_digest) = client.download_piece(0, task_id).await.unwrap();
+    let mut downloaded = Vec::new();
+    reader.read_to_end(&mut downloaded).await.unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(got_digest, digest);
+    assert_eq!(downloaded, content);
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_piece_across_window_boundaries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let task_id = "b269ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    let content: Vec<u8> = (0..3 * 1024 * 1024 + 123)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let digest = write_piece(&storage, task_id, 0, &content).await;
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) =
+        start_server(config.clone(), storage).await;
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+
+    for (chunk_size, max_inflight_chunks) in [
+        (bytesize::ByteSize::kib(64), 1),
+        (bytesize::ByteSize::kib(64), 4),
+        (bytesize::ByteSize::kib(64), 16),
+        (bytesize::ByteSize::mib(1), 2),
+        (bytesize::ByteSize::mib(1), 3),
+    ] {
+        let mut client_config = config.as_ref().clone();
+        client_config.storage.server.rdma.chunk_size = chunk_size;
+        client_config.storage.server.rdma.max_inflight_chunks = max_inflight_chunks;
+        let client = RDMAClient::new(
+            Arc::new(client_config),
+            fabric.clone(),
+            capability.clone(),
+            addr.clone(),
+        );
+        let (mut reader, offset, got_digest) = client.download_piece(0, task_id).await.unwrap();
+        let mut downloaded = Vec::new();
+        reader.read_to_end(&mut downloaded).await.unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(got_digest, digest);
+        assert_eq!(downloaded, content);
+    }
 
     shutdown.trigger();
 }
@@ -308,6 +549,278 @@ async fn reports_missing_piece() {
         "a missing piece must not mark the parent incompatible: {:?}",
         err
     );
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_control_error_while_receive_is_pending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        let request = match read_frame(&mut reader).await.unwrap() {
+            Frame::Request(request) => request,
+            frame => panic!("expected Request, got {frame:?}"),
+        };
+        write_frame(
+            &mut writer,
+            &Frame::Ready(PieceReady {
+                offset: 0,
+                length: 4096,
+                digest: "crc32:00000000".to_string(),
+                server_endpoint: vec![1],
+                chunk_size: request.chunk_size.min(4096),
+                max_inflight_chunks: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut reader).await.unwrap(),
+            Frame::RecvPosted {
+                start_chunk: 0,
+                chunk_count: 1
+            }
+        ));
+        write_frame(
+            &mut writer,
+            &Frame::Error(RendezvousError {
+                code: ERROR_CODE_INTERNAL,
+                message: "injected staging failure".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut config = test_config();
+    config.storage.server.rdma.chunk_size = bytesize::ByteSize::kib(4);
+    config.storage.server.rdma.max_inflight_chunks = 1;
+    config.storage.server.rdma.transfer_timeout = Duration::from_secs(5);
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let client = RDMAClient::new(Arc::new(config), fabric, capability, addr.to_string());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.download_piece(0, "control-error-task"),
+    )
+    .await
+    .expect("control error should interrupt the pending fabric receive");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("injected staging failure"),
+        "unexpected error: {err}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_out_of_order_receive_window() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let task_id = "e869ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    write_piece(&storage, task_id, 0, &[0x5a; 8192]).await;
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) = start_server(config, storage).await;
+
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    write_frame(
+        &mut writer,
+        &Frame::Request(PieceRequest {
+            kind: PieceKind::Piece,
+            task_id: task_id.to_string(),
+            piece_number: 0,
+            capability,
+            client_endpoint: fabric.local_endpoint().to_vec(),
+            tag: fabric.next_tag().unwrap(),
+            chunk_size: 4096,
+            max_inflight_chunks: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap(),
+        Frame::Ready(_)
+    ));
+
+    write_frame(
+        &mut writer,
+        &Frame::RecvPosted {
+            start_chunk: 1,
+            chunk_count: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader))
+        .await
+        .expect("server should reject the invalid window immediately")
+        .unwrap();
+    match frame {
+        Frame::Error(err) => {
+            assert_eq!(err.code, ERROR_CODE_INTERNAL);
+            assert!(err.message.contains("invalid rdma receive window"));
+        }
+        frame => panic!("expected Error, got {frame:?}"),
+    }
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_a_wrapping_transfer_tag_range() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let task_id = "d869ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    write_piece(&storage, task_id, 0, &[0x6b; 8192]).await;
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) = start_server(config, storage).await;
+
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    write_frame(
+        &mut writer,
+        &Frame::Request(PieceRequest {
+            kind: PieceKind::Piece,
+            task_id: task_id.to_string(),
+            piece_number: 0,
+            capability,
+            client_endpoint: fabric.local_endpoint().to_vec(),
+            tag: u64::MAX,
+            chunk_size: 4096,
+            max_inflight_chunks: 2,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader))
+        .await
+        .expect("server should reject a wrapping tag range immediately")
+        .unwrap();
+    match frame {
+        Frame::Error(err) => {
+            assert_eq!(err.code, ERROR_CODE_INTERNAL);
+            assert!(err.message.contains("tag range wraps around"));
+        }
+        frame => panic!("expected Error, got {frame:?}"),
+    }
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn times_out_stalled_piece_transfer() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    config.download.piece_timeout = Duration::from_millis(200);
+    config.storage.server.rdma.transfer_timeout = Duration::from_secs(5);
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let task_id = "f869ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    write_piece(&storage, task_id, 0, &[0x31; 8192]).await;
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) = start_server(config, storage).await;
+
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    write_frame(
+        &mut writer,
+        &Frame::Request(PieceRequest {
+            kind: PieceKind::Piece,
+            task_id: task_id.to_string(),
+            piece_number: 0,
+            capability,
+            client_endpoint: fabric.local_endpoint().to_vec(),
+            tag: fabric.next_tag().unwrap(),
+            chunk_size: 4096,
+            max_inflight_chunks: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut reader).await.unwrap(),
+        Frame::Ready(_)
+    ));
+
+    let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader))
+        .await
+        .expect("server should time out a client that never posts receives")
+        .unwrap();
+    match frame {
+        Frame::Error(err) => assert!(err.message.contains("piece transfer timed out")),
+        frame => panic!("expected Error, got {frame:?}"),
+    }
+
+    shutdown.trigger();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_connections_over_the_transfer_admission_limit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    assign_free_ports(&mut config);
+    config.storage.server.rdma.max_concurrent_transfers = 1;
+    config.storage.server.rdma.transfer_timeout = Duration::from_secs(5);
+    let config = Arc::new(config);
+    let storage = Arc::new(
+        Storage::new(
+            config.clone(),
+            temp_dir.path(),
+            temp_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) = start_server(config, storage).await;
+
+    // The first idle connection consumes the sole admission permit while it waits for a frame.
+    let _held = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The listener accepts and closes overload rather than spawning an unbounded waiting task.
+    let second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let (mut reader, _writer) = second.into_split();
+    let result = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader))
+        .await
+        .expect("over-limit connection should be closed immediately");
+    assert!(result.is_err());
 
     shutdown.trigger();
 }

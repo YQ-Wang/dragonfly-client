@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::rdma::fabric::{Fabric, PooledBufReader};
+use crate::rdma::fabric::{Fabric, PooledBufReader, TAG_RANGE_SIZE};
 use crate::rdma::rendezvous::{
     read_frame, write_frame, Frame, PieceKind, PieceRequest, RdmaAdvertisement, WireCapability,
     ERROR_CODE_INCOMPATIBLE,
@@ -28,7 +28,7 @@ use tokio::time;
 use tracing::{debug, error, instrument, Span};
 
 /// MAX_CHUNKS caps the number of fabric messages (and thus posted receives) per piece.
-pub(crate) const MAX_CHUNKS: u64 = 4096;
+pub(crate) const MAX_CHUNKS: u64 = TAG_RANGE_SIZE;
 
 /// discover asks the parent's already-advertised TCP piece endpoint for its live RDMA
 /// capability and rendezvous port. Older and non-RDMA peers simply fail this optional probe.
@@ -183,9 +183,13 @@ impl RDMAClient {
         )?;
         let (mut reader, mut writer) = stream.into_split();
 
-        let tag = self.fabric.next_tag();
+        let tag = self.fabric.next_tag()?;
         let configured_chunk_size = self.config.storage.server.rdma.chunk_size.as_u64();
         if configured_chunk_size == 0 {
+            return Err(ClientError::InvalidParameter);
+        }
+        let max_inflight_chunks = self.config.storage.server.rdma.max_inflight_chunks;
+        if max_inflight_chunks == 0 || u64::from(max_inflight_chunks) > MAX_CHUNKS {
             return Err(ClientError::InvalidParameter);
         }
         let chunk_size = configured_chunk_size.min(self.fabric.max_msg_size() as u64);
@@ -199,6 +203,7 @@ impl RDMAClient {
                 client_endpoint: self.fabric.local_endpoint().to_vec(),
                 tag,
                 chunk_size,
+                max_inflight_chunks,
             }),
         )
         .await?;
@@ -225,14 +230,19 @@ impl RDMAClient {
             }
         };
         debug!(
-            "rdma piece ready: offset {}, length {}, chunk size {}",
-            ready.offset, ready.length, ready.chunk_size
+            "rdma piece ready: offset {}, length {}, chunk size {}, inflight chunks {}",
+            ready.offset, ready.length, ready.chunk_size, ready.max_inflight_chunks
         );
 
-        if ready.length == 0 || ready.chunk_size == 0 || ready.chunk_size > chunk_size {
+        if ready.length == 0
+            || ready.chunk_size == 0
+            || ready.chunk_size > chunk_size
+            || ready.max_inflight_chunks == 0
+            || ready.max_inflight_chunks > max_inflight_chunks
+        {
             return Err(ClientError::Unknown(format!(
-                "invalid rdma piece metadata: length {}, chunk size {}",
-                ready.length, ready.chunk_size
+                "invalid rdma piece metadata: length {}, chunk size {}, inflight chunks {}",
+                ready.length, ready.chunk_size, ready.max_inflight_chunks
             )));
         }
         let chunk_count = ready.length.div_ceil(ready.chunk_size);
@@ -242,48 +252,104 @@ impl RDMAClient {
                 chunk_count, MAX_CHUNKS
             )));
         }
+        let transfer_length = usize::try_from(ready.length).map_err(|_| {
+            ClientError::Unknown("rdma piece exceeds addressable memory".to_string())
+        })?;
 
-        // Post every receive before telling the parent to send (rendezvous ordering): EFA
-        // has limited unexpected-message buffering, so the receiver must be ready first.
-        let buf = self.fabric.acquire_buffer(ready.length as usize).await?;
-        let mut ops = Vec::with_capacity(chunk_count as usize);
-        for chunk in 0..chunk_count {
-            let offset = chunk * ready.chunk_size;
-            let len = ready.chunk_size.min(ready.length - offset);
-            ops.push((
-                len as usize,
-                self.fabric
-                    .post_recv(
-                        buf.buffer(),
-                        offset as usize,
-                        len as usize,
-                        tag.wrapping_add(chunk),
-                    )
-                    .await?,
-            ));
-        }
-        write_frame(&mut writer, &Frame::RecvPosted).await?;
-
+        // Keep the destination as one completed lease so upstream can still fall back to TCP
+        // before it starts writing the piece. Receives themselves are posted in bounded windows:
+        // EFA has limited unexpected-message buffering, while providers also have finite posted
+        // receive queues.
+        let buf = self.fabric.acquire_buffer(transfer_length).await?;
         let transfer_timeout = self.config.storage.server.rdma.transfer_timeout;
-        for (expected_len, op) in ops {
-            let len = self.fabric.wait(op, transfer_timeout).await?;
-            if len != expected_len {
-                return Err(ClientError::Unknown(format!(
-                    "rdma chunk length mismatch: expected {}, got {}",
-                    expected_len, len
-                )));
+        let control = read_frame(&mut reader);
+        tokio::pin!(control);
+        let mut server_done = false;
+        let mut start_chunk = 0;
+        while start_chunk < chunk_count {
+            let window_count =
+                (chunk_count - start_chunk).min(ready.max_inflight_chunks as u64) as u32;
+            let final_window = start_chunk + u64::from(window_count) == chunk_count;
+            let mut ops = Vec::with_capacity(window_count as usize);
+            for chunk in start_chunk..start_chunk + u64::from(window_count) {
+                let offset = chunk * ready.chunk_size;
+                let len = ready.chunk_size.min(ready.length - offset);
+                ops.push((
+                    len as usize,
+                    self.fabric
+                        .post_recv(buf.buffer(), offset as usize, len as usize, tag + chunk)
+                        .await?,
+                ));
             }
+            write_frame(
+                &mut writer,
+                &Frame::RecvPosted {
+                    start_chunk,
+                    chunk_count: window_count,
+                },
+            )
+            .await?;
+
+            for (expected_len, op) in ops {
+                let wait = self.fabric.wait(op, transfer_timeout);
+                tokio::pin!(wait);
+                let len = if server_done {
+                    wait.await?
+                } else {
+                    tokio::select! {
+                        result = &mut wait => result?,
+                        frame = &mut control => {
+                            match frame {
+                                Ok(Frame::Error(err)) => {
+                                    return Err(ClientError::Unknown(format!(
+                                        "rdma transfer failed on parent: {}",
+                                        err.message
+                                    )));
+                                }
+                                Ok(Frame::Done) if final_window => {
+                                    server_done = true;
+                                    wait.await?
+                                }
+                                Ok(frame) => {
+                                    return Err(ClientError::Unknown(format!(
+                                        "unexpected rendezvous frame during transfer: {:?}",
+                                        frame
+                                    )));
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
+                    }
+                };
+                if len != expected_len {
+                    return Err(ClientError::Unknown(format!(
+                        "rdma chunk length mismatch: expected {}, got {}",
+                        expected_len, len
+                    )));
+                }
+            }
+            start_chunk += u64::from(window_count);
         }
 
-        // Best-effort read of the parent's Done frame; the local completions above are
-        // authoritative for the landed bytes.
-        if let Ok(Ok(Frame::Error(err))) =
-            time::timeout(transfer_timeout, read_frame(&mut reader)).await
-        {
-            return Err(ClientError::Unknown(format!(
-                "rdma transfer failed on parent: {}",
-                err.message
-            )));
+        // Local receive completions prove the bytes landed; Done proves the parent also reaped
+        // every send and did not fail while staging a later window.
+        if !server_done {
+            match time::timeout(transfer_timeout, &mut control).await? {
+                Ok(Frame::Done) => {}
+                Ok(Frame::Error(err)) => {
+                    return Err(ClientError::Unknown(format!(
+                        "rdma transfer failed on parent: {}",
+                        err.message
+                    )));
+                }
+                Ok(frame) => {
+                    return Err(ClientError::Unknown(format!(
+                        "unexpected rendezvous frame: {:?}",
+                        frame
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         Ok((buf.into_reader(), ready.offset, ready.digest))
