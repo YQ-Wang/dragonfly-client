@@ -1090,6 +1090,13 @@ pub struct RdmaServer {
         with = "humantime_serde"
     )]
     pub transfer_timeout: Duration,
+
+    /// When true, the RDMA server memory-maps finished on-disk piece content and fills the
+    /// registered send ring from that mapping instead of streaming through `AsyncRead`. This
+    /// removes the intermediate read-buffer copy on the upload path. Mapping or registration
+    /// failures fall back to the streaming reader. Cache-resident pieces always use the reader.
+    #[serde(default)]
+    pub mmap_content: bool,
 }
 
 /// RdmaServer implements Default.
@@ -1107,6 +1114,7 @@ impl Default for RdmaServer {
             max_inflight_chunks: default_storage_server_rdma_max_inflight_chunks(),
             max_concurrent_transfers: default_storage_server_rdma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_rdma_transfer_timeout(),
+            mmap_content: false,
         }
     }
 }

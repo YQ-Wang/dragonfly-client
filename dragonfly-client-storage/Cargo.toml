@@ -36,11 +36,18 @@ bincode = "1.3.3"
 walkdir = "2.5.0"
 quinn = "0.11.9"
 socket2 = "0.6.3"
+memmap2 = "0.9"
+sha2.workspace = true
+hex.workspace = true
 
 [features]
 # rdma enables the libfabric piece transport (AWS EFA and RoCE/InfiniBand verbs).
 # Requires libfabric headers and library at build time; see build.rs.
 rdma = []
+
+[[example]]
+name = "efa_cross_node"
+required-features = ["rdma"]
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -60,6 +60,7 @@ fn test_config() -> Config {
     config.storage.server.rdma.allow_software_provider = true;
     config.storage.server.rdma.fabric_tag = Some(FABRIC_TAG.to_string());
     config.storage.server.rdma.transfer_timeout = Duration::from_secs(10);
+    config.storage.server.rdma.mmap_content = true;
     config
 }
 
@@ -298,7 +299,11 @@ async fn downloads_piece_over_rdma() {
     let (tcp_addr, addr, shutdown, _shutdown_complete_rx) =
         start_server(config.clone(), storage).await;
 
-    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let fabric = Arc::new(Fabric::new(None, None, 2 * 1024 * 1024, true).unwrap());
+    let capability = WireCapability {
+        provider: fabric.provider().to_string(),
+        fabric_tag: FABRIC_TAG.to_string(),
+    };
     let advertisement = discover(&tcp_addr, Duration::from_secs(5)).await.unwrap();
     assert_eq!(advertisement.port, config.storage.server.rdma.port);
     assert!(capability.compatible(&advertisement.capability).is_ok());
@@ -318,13 +323,15 @@ async fn downloads_piece_over_rdma() {
         let mut downloaded = Vec::new();
         reader.read_to_end(&mut downloaded).await.unwrap();
         assert_eq!(downloaded, content);
-        // Releasing the reader returns its completed registration to the client pool.
+        // Consuming the stream lets the bounded receive-window registration return to the pool.
         drop(reader);
     }
     let stats = fabric.buffer_pool_stats();
-    assert_eq!(stats.misses, 1);
-    assert_eq!(stats.hits, 1);
-    assert_eq!(stats.cached_buffers, 1);
+    assert!(stats.misses <= 3);
+    assert!(stats.hits >= 1);
+    assert!(stats.cached_buffers <= 3);
+    assert!(stats.cached_bytes <= 3 * 2 * 1024 * 1024);
+    assert!(stats.cached_bytes < content.len());
 
     shutdown.trigger();
 }
@@ -602,13 +609,18 @@ async fn reports_control_error_while_receive_is_pending() {
     let (fabric, capability) = client_fabric(FABRIC_TAG);
     let client = RDMAClient::new(Arc::new(config), fabric, capability, addr.to_string());
 
-    let result = tokio::time::timeout(
+    let (mut piece_reader, _, _) = client
+        .download_piece(0, "control-error-task")
+        .await
+        .expect("stream setup should complete after Ready");
+    let mut content = Vec::new();
+    let err = tokio::time::timeout(
         Duration::from_secs(1),
-        client.download_piece(0, "control-error-task"),
+        piece_reader.read_to_end(&mut content),
     )
     .await
-    .expect("control error should interrupt the pending fabric receive");
-    let err = result.unwrap_err();
+    .expect("control error should interrupt the pending fabric receive")
+    .unwrap_err();
     assert!(
         err.to_string().contains("injected staging failure"),
         "unexpected error: {err}"

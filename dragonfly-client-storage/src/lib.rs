@@ -935,6 +935,91 @@ impl Storage {
         }
     }
 
+    /// map_upload_piece memory-maps finished on-disk piece bytes for RDMA upload. Cache-resident
+    /// pieces and missing content return an error so callers can fall back to `upload_piece`.
+    #[instrument(skip_all)]
+    pub async fn map_upload_piece(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        kind: crate::rdma::rendezvous::PieceKind,
+    ) -> Result<content::MappedPiece> {
+        let piece = match kind {
+            crate::rdma::rendezvous::PieceKind::Piece => {
+                self.wait_for_piece_finished(piece_id).await?
+            }
+            crate::rdma::rendezvous::PieceKind::PersistentPiece => {
+                self.wait_for_persistent_piece_finished(piece_id).await?
+            }
+            crate::rdma::rendezvous::PieceKind::PersistentCachePiece => {
+                self.wait_for_persistent_cache_piece_finished(piece_id)
+                    .await?
+            }
+        };
+
+        if self.cache.contains_piece(task_id, piece_id).await {
+            return Err(Error::Unsupported(
+                "rdma mmap upload is unavailable for cache-resident pieces".to_string(),
+            ));
+        }
+
+        match kind {
+            crate::rdma::rendezvous::PieceKind::Piece => {
+                self.metadata.upload_task_started(task_id)?;
+                match self
+                    .content
+                    .map_piece(task_id, piece.offset, piece.length)
+                    .await
+                {
+                    Ok(mapped) => {
+                        self.metadata.upload_task_finished(task_id)?;
+                        Ok(mapped)
+                    }
+                    Err(err) => {
+                        self.metadata.upload_task_failed(task_id)?;
+                        Err(err)
+                    }
+                }
+            }
+            crate::rdma::rendezvous::PieceKind::PersistentPiece => {
+                self.metadata.upload_persistent_task_started(task_id)?;
+                match self
+                    .content
+                    .map_persistent_piece(task_id, piece.offset, piece.length)
+                    .await
+                {
+                    Ok(mapped) => {
+                        self.metadata.upload_persistent_task_finished(task_id)?;
+                        Ok(mapped)
+                    }
+                    Err(err) => {
+                        self.metadata.upload_persistent_task_failed(task_id)?;
+                        Err(err)
+                    }
+                }
+            }
+            crate::rdma::rendezvous::PieceKind::PersistentCachePiece => {
+                self.metadata
+                    .upload_persistent_cache_task_started(task_id)?;
+                match self
+                    .content
+                    .map_persistent_cache_piece(task_id, piece.offset, piece.length)
+                    .await
+                {
+                    Ok(mapped) => {
+                        self.metadata
+                            .upload_persistent_cache_task_finished(task_id)?;
+                        Ok(mapped)
+                    }
+                    Err(err) => {
+                        self.metadata.upload_persistent_cache_task_failed(task_id)?;
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+
     /// get_piece returns the piece metadata.
     pub fn get_piece(&self, piece_id: &str) -> Result<Option<metadata::Piece>> {
         self.metadata.get_piece(piece_id)

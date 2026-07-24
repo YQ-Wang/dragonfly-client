@@ -147,6 +147,9 @@ duplicate source traffic materially.
 - Reuse or multiplex TCP rendezvous connections when small-piece setup time is measurable.
 - Evaluate content-store mmap registration to remove the sender copy only with explicit eviction
   and registration-lifetime rules.
+  - Implemented first cut: `storage.server.rdma.mmapContent` maps finished on-disk pieces and
+    fills the registered send ring from the mapping (with AsyncRead fallback for cache hits /
+    map failures). Full NIC registration of mapped pages remains future work.
 - Consider sharing upload/download `Fabric` instances only after failure-isolation soak tests.
 - Consider one-sided RMA or `FI_HMEM` only for a future authenticated remote-key model or a
   GPU-resident cache API.

@@ -403,6 +403,17 @@ impl Piece {
             .acquire(length as usize)
             .await;
 
+        let rdma_tcp_addr = if self.config.download.protocol == "rdma" {
+            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
+                (Some(ip), Some(port)) => {
+                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut streamed_rdma = false;
         let (mut reader, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -443,7 +454,10 @@ impl Piece {
                     )
                     .await
                 {
-                    Ok(downloaded) => downloaded,
+                    Ok(downloaded) => {
+                        streamed_rdma = true;
+                        downloaded
+                    }
                     // RDMA is an optimization: any rendezvous or fabric error falls back to
                     // the parent's TCP piece server for this piece.
                     Err(err) => {
@@ -512,8 +526,38 @@ impl Piece {
                 Ok(piece)
             }
             Err(err) => {
-                error!("download piece finished: {}", err);
-                Err(err)
+                let Some(addr) = rdma_tcp_addr.filter(|_| streamed_rdma) else {
+                    error!("download piece finished: {}", err);
+                    return Err(err);
+                };
+                warn!(
+                    "streaming rdma piece failed while writing, restarting over tcp: {}",
+                    err
+                );
+                self.storage.download_piece_failed(piece_id)?;
+                self.storage
+                    .download_piece_started(piece_id, number)
+                    .await?;
+                let (mut reader, offset, digest) = self
+                    .tcp_downloader
+                    .download_piece(&addr, number, host_id, task_id)
+                    .await?;
+                let piece = self
+                    .storage
+                    .download_piece_from_parent_finished(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent.id.as_str(),
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await?;
+                collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                scopeguard::ScopeGuard::into_inner(guard);
+                Ok(piece)
             }
         }
     }
@@ -832,6 +876,17 @@ impl Piece {
             return Ok(piece);
         }
 
+        let rdma_tcp_addr = if self.config.download.protocol == "rdma" {
+            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
+                (Some(ip), Some(port)) => {
+                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut streamed_rdma = false;
         let (mut reader, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -872,7 +927,10 @@ impl Piece {
                     )
                     .await
                 {
-                    Ok(downloaded) => downloaded,
+                    Ok(downloaded) => {
+                        streamed_rdma = true;
+                        downloaded
+                    }
                     // RDMA is an optimization: any rendezvous or fabric error falls back to
                     // the parent's TCP piece server for this piece.
                     Err(err) => {
@@ -940,8 +998,37 @@ impl Piece {
                 Ok(piece)
             }
             Err(err) => {
-                error!("download persistent piece finished: {}", err);
-                Err(err)
+                let Some(addr) = rdma_tcp_addr.filter(|_| streamed_rdma) else {
+                    error!("download persistent piece finished: {}", err);
+                    return Err(err);
+                };
+                warn!(
+                    "streaming rdma persistent piece failed while writing, restarting over tcp: {}",
+                    err
+                );
+                self.storage.download_persistent_piece_failed(piece_id)?;
+                self.storage
+                    .download_persistent_piece_started(piece_id, number)
+                    .await?;
+                let (mut reader, offset, digest) = self
+                    .tcp_downloader
+                    .download_persistent_piece(&addr, number, host_id, task_id)
+                    .await?;
+                let piece = self
+                    .storage
+                    .download_persistent_piece_from_parent_finished(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent.id.as_str(),
+                        &mut reader,
+                    )
+                    .await?;
+                collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                scopeguard::ScopeGuard::into_inner(guard);
+                Ok(piece)
             }
         }
     }
@@ -1215,6 +1302,17 @@ impl Piece {
             return Ok(piece);
         }
 
+        let rdma_tcp_addr = if self.config.download.protocol == "rdma" {
+            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
+                (Some(ip), Some(port)) => {
+                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut streamed_rdma = false;
         let (mut reader, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -1255,7 +1353,10 @@ impl Piece {
                     )
                     .await
                 {
-                    Ok(downloaded) => downloaded,
+                    Ok(downloaded) => {
+                        streamed_rdma = true;
+                        downloaded
+                    }
                     // RDMA is an optimization: any rendezvous or fabric error falls back to
                     // the parent's TCP piece server for this piece.
                     Err(err) => {
@@ -1323,8 +1424,38 @@ impl Piece {
                 Ok(piece)
             }
             Err(err) => {
-                error!("download persistent cache piece finished: {}", err);
-                Err(err)
+                let Some(addr) = rdma_tcp_addr.filter(|_| streamed_rdma) else {
+                    error!("download persistent cache piece finished: {}", err);
+                    return Err(err);
+                };
+                warn!(
+                    "streaming rdma persistent cache piece failed while writing, restarting over tcp: {}",
+                    err
+                );
+                self.storage
+                    .download_persistent_cache_piece_failed(piece_id)?;
+                self.storage
+                    .download_persistent_cache_piece_started(piece_id, number)
+                    .await?;
+                let (mut reader, offset, digest) = self
+                    .tcp_downloader
+                    .download_persistent_cache_piece(&addr, number, host_id, task_id)
+                    .await?;
+                let piece = self
+                    .storage
+                    .download_persistent_cache_piece_from_parent_finished(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent.id.as_str(),
+                        &mut reader,
+                    )
+                    .await?;
+                collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                scopeguard::ScopeGuard::into_inner(guard);
+                Ok(piece)
             }
         }
     }

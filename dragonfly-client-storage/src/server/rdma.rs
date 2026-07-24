@@ -15,6 +15,7 @@
  */
 
 use crate::client::rdma::MAX_CHUNKS;
+use crate::content::MappedPiece;
 use crate::rdma::fabric::Fabric;
 use crate::rdma::rendezvous::{
     read_frame, write_frame, CapabilityRegistry, Frame, PieceKind, PieceReady, PieceRequest,
@@ -40,7 +41,7 @@ use tokio::net::{
 };
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time;
-use tracing::{debug, error, info, instrument, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 /// RDMAServer serves piece content over the libfabric transport. It accepts rendezvous
 /// connections on a TCP port, negotiates fabric compatibility fail-closed, and pushes bulk
@@ -165,6 +166,7 @@ impl RDMAServer {
             max_registered_bytes: rdma_config.max_registered_bytes.as_u64(),
             transfer_timeout: rdma_config.transfer_timeout,
             piece_timeout: self.config.download.piece_timeout,
+            mmap_content: rdma_config.mmap_content,
         };
         let handler = Arc::new(handler);
         let transfer_admission = Arc::new(Semaphore::new(
@@ -267,6 +269,9 @@ struct RDMAServerHandler {
     /// piece_timeout bounds the complete server-side operation, including storage staging and
     /// registered-memory admission.
     piece_timeout: std::time::Duration,
+
+    /// mmap_content fills the send ring from a memory-mapped content file when possible.
+    mmap_content: bool,
 }
 
 /// RDMAServerHandler implements the per-connection transfer flow.
@@ -450,26 +455,8 @@ impl RDMAServerHandler {
         // Acquire the upload bandwidth limiter, matching the TCP server.
         self.upload_bandwidth_limiter.acquire(piece_length).await;
 
-        let content_reader: ClientResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> =
-            match request.kind {
-                PieceKind::Piece => self
-                    .storage
-                    .upload_piece(&piece_id, &request.task_id, None)
-                    .await
-                    .map(|reader| Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-                PieceKind::PersistentPiece => self
-                    .storage
-                    .upload_persistent_piece(&piece_id, &request.task_id, None)
-                    .await
-                    .map(|reader| Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-                PieceKind::PersistentCachePiece => self
-                    .storage
-                    .upload_persistent_cache_piece(&piece_id, &request.task_id, None)
-                    .await
-                    .map(|reader| Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-            };
-        let mut content_reader = match content_reader {
-            Ok(content_reader) => content_reader,
+        let mut source = match self.open_piece_source(request, &piece_id).await {
+            Ok(source) => source,
             Err(err) => {
                 self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
                     .await?;
@@ -478,7 +465,7 @@ impl RDMAServerHandler {
         };
 
         // Use a two-window registered ring when the piece spans multiple windows. While the NIC
-        // sends one half, the storage reader fills the other. A one-window piece still allocates
+        // sends one half, the storage path fills the other. A one-window piece still allocates
         // only its logical length.
         let window_capacity = piece
             .length
@@ -517,10 +504,10 @@ impl RDMAServerHandler {
         })?;
         // Safety: no fabric operation has been posted over the staging ring.
         let first_window = unsafe { &mut buf.as_mut_slice()[..first_window_length] };
-        if let Err(err) = content_reader.read_exact(first_window).await {
+        if let Err(err) = source.fill(0, first_window).await {
             self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
                 .await?;
-            return Err(err.into());
+            return Err(err);
         }
 
         write_frame(
@@ -600,7 +587,12 @@ impl RDMAServerHandler {
                             "rdma staging window exceeds addressable memory".to_string(),
                         )
                     })?;
-                let read_result = if ring_windows == 2 {
+                let next_piece_offset = usize::try_from(next_piece_offset).map_err(|_| {
+                    ClientError::Unknown(
+                        "rdma staging window exceeds addressable memory".to_string(),
+                    )
+                })?;
+                if ring_windows == 2 {
                     // Safety: this half of the ring is disjoint from the window currently
                     // visible to the provider. Its previous send, if any, completed two
                     // iterations earlier.
@@ -609,19 +601,12 @@ impl RDMAServerHandler {
                             next_window_offset..next_window_offset + next_window_length,
                         )
                     };
-                    let read_window = async {
-                        content_reader
-                            .read_exact(next_window)
-                            .await
-                            .map(|_| ())
-                            .map_err(ClientError::from)
-                    };
+                    let read_window = source.fill(next_piece_offset, next_window);
                     if let Err(err) = tokio::try_join!(send_window, read_window) {
                         self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
                             .await?;
                         return Err(err);
                     }
-                    Ok(0)
                 } else {
                     // With only one window of registration budget, wait for its sends before
                     // safely refilling the same prefix.
@@ -632,19 +617,16 @@ impl RDMAServerHandler {
                     }
                     // Safety: every send over the single window completed above.
                     let next_window = unsafe { &mut buf.as_mut_slice()[..next_window_length] };
-                    content_reader.read_exact(next_window).await
-                };
-                if let Err(err) = read_result {
-                    self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
-                        .await?;
-                    return Err(err.into());
+                    if let Err(err) = source.fill(next_piece_offset, next_window).await {
+                        self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                            .await?;
+                        return Err(err);
+                    }
                 }
-            } else {
-                if let Err(err) = send_window.await {
-                    self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
-                        .await?;
-                    return Err(err);
-                }
+            } else if let Err(err) = send_window.await {
+                self.abort(writer, ERROR_CODE_INTERNAL, err.to_string())
+                    .await?;
+                return Err(err);
             }
 
             start_chunk = next_start_chunk;
@@ -656,6 +638,56 @@ impl RDMAServerHandler {
         Ok(piece.length)
     }
 
+    /// open_piece_source prefers a content mmap when configured, otherwise streams through the
+    /// existing upload readers. Cache-resident pieces always use the reader path.
+    async fn open_piece_source(
+        &self,
+        request: &PieceRequest,
+        piece_id: &str,
+    ) -> ClientResult<PieceSource> {
+        if self.mmap_content {
+            match self
+                .storage
+                .map_upload_piece(piece_id, &request.task_id, request.kind)
+                .await
+            {
+                Ok(mapped) => {
+                    debug!("rdma upload using mmap content for piece {}", piece_id);
+                    return Ok(PieceSource::Mapped(mapped));
+                }
+                Err(err) => {
+                    warn!(
+                        "rdma mmap upload unavailable for piece {}, falling back to reader: {}",
+                        piece_id, err
+                    );
+                }
+            }
+        }
+
+        let content_reader: ClientResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> =
+            match request.kind {
+                PieceKind::Piece => self
+                    .storage
+                    .upload_piece(piece_id, &request.task_id, None)
+                    .await
+                    .map(|reader| Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+                PieceKind::PersistentPiece => self
+                    .storage
+                    .upload_persistent_piece(piece_id, &request.task_id, None)
+                    .await
+                    .map(|reader| Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+                PieceKind::PersistentCachePiece => self
+                    .storage
+                    .upload_persistent_cache_piece(piece_id, &request.task_id, None)
+                    .await
+                    .map(|reader| Box::new(reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+            };
+        match content_reader {
+            Ok(reader) => Ok(PieceSource::Reader(reader)),
+            Err(err) => Err(err),
+        }
+    }
+
     /// abort reports an error to the client over the rendezvous channel.
     async fn abort(
         &self,
@@ -665,5 +697,36 @@ impl RDMAServerHandler {
     ) -> ClientResult<()> {
         error!("aborting rdma transfer: {}", message);
         write_frame(writer, &Frame::Error(RendezvousError { code, message })).await
+    }
+}
+
+/// PieceSource supplies bytes for the registered send ring.
+enum PieceSource {
+    /// Mapped copies directly from a content-file memory map.
+    Mapped(MappedPiece),
+    /// Reader streams through the existing upload path, including cache hits.
+    Reader(Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+}
+
+impl PieceSource {
+    /// Fills `dst` with `dst.len()` bytes beginning at `piece_offset` within the piece.
+    async fn fill(&mut self, piece_offset: usize, dst: &mut [u8]) -> ClientResult<()> {
+        match self {
+            Self::Mapped(mapped) => {
+                let end = piece_offset
+                    .checked_add(dst.len())
+                    .ok_or(ClientError::InvalidParameter)?;
+                let Some(src) = mapped.as_slice().get(piece_offset..end) else {
+                    return Err(ClientError::Unknown(format!(
+                        "mmap piece underflow at offset {} length {}",
+                        piece_offset,
+                        dst.len()
+                    )));
+                };
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+            Self::Reader(reader) => reader.read_exact(dst).await.map(|_| ()).map_err(Into::into),
+        }
     }
 }
