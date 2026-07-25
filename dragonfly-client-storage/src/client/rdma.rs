@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::rdma::fabric::{Fabric, PooledBuf, TAG_RANGE_SIZE};
+use crate::rdma::fabric::{Fabric, OpHandle, PooledBuf, TAG_RANGE_SIZE};
 use crate::rdma::rendezvous::{
     read_frame, write_frame, Frame, PieceKind, PieceReady, PieceRequest, RdmaAdvertisement,
     WireCapability, ERROR_CODE_INCOMPATIBLE,
@@ -22,6 +22,7 @@ use crate::rdma::rendezvous::{
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
 use socket2::{SockRef, TcpKeepalive};
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -439,6 +440,35 @@ impl RDMAClient {
     }
 }
 
+/// RECEIVE_PIPELINE_DEPTH is how many receive windows are kept posted at once.
+const RECEIVE_PIPELINE_DEPTH: usize = 2;
+
+/// PostedWindow is a receive window whose chunks are posted to the fabric and named in a
+/// RecvPosted frame, but whose completions have not been reaped yet.
+struct PostedWindow {
+    /// buf is the registered memory the NIC writes into.
+    buf: PooledBuf,
+
+    /// ops pairs each posted chunk with the length it must complete with.
+    ops: Vec<(usize, OpHandle)>,
+
+    /// chunk_count is how many chunks of the piece this window covers.
+    chunk_count: u32,
+}
+
+/// window_buf_length returns the byte length of the receive window that starts at `start_chunk`.
+fn window_buf_length(ready: &PieceReady, start_chunk: u64) -> ClientResult<usize> {
+    let length = ready
+        .length
+        .saturating_sub(start_chunk.saturating_mul(ready.chunk_size))
+        .min(
+            ready
+                .chunk_size
+                .saturating_mul(u64::from(ready.max_inflight_chunks)),
+        );
+    usize::try_from(length).map_err(|_| ClientError::InvalidParameter)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_stream(
     fabric: Arc<Fabric>,
@@ -454,44 +484,79 @@ async fn receive_stream(
     let control = read_frame(&mut reader);
     tokio::pin!(control);
     let mut server_done = false;
-    let mut start_chunk = 0;
+
+    // The parent may not send a window until the RecvPosted frame naming it arrives. Posting one
+    // window at a time therefore leaves the fabric idle for a control-plane round trip between
+    // every window, and defeats the parent's two-window send ring: it has the next window staged
+    // but nowhere to put it. Keeping a second window posted means the parent can start sending it
+    // the moment the first is on the wire.
+    let mut posted: VecDeque<PostedWindow> = VecDeque::with_capacity(RECEIVE_PIPELINE_DEPTH);
     let mut next_buf = Some(buf);
+    let mut posted_chunk = 0u64;
+    let mut drained_chunk = 0u64;
 
-    while start_chunk < chunk_count {
-        let window_buf = next_buf.take().expect("receive window buffer");
-        let window_count = (chunk_count - start_chunk).min(ready.max_inflight_chunks as u64) as u32;
-        let final_window = start_chunk + u64::from(window_count) == chunk_count;
-        let window_piece_offset = start_chunk * ready.chunk_size;
-        let mut window_length = 0usize;
-        let mut ops = Vec::with_capacity(window_count as usize);
+    while drained_chunk < chunk_count {
+        // Post as far ahead as the pipeline depth and the registration budget allow.
+        while posted.len() < RECEIVE_PIPELINE_DEPTH && posted_chunk < chunk_count {
+            let window_buf = match next_buf.take() {
+                Some(buf) => buf,
+                None => {
+                    let length = window_buf_length(&ready, posted_chunk)?;
+                    match fabric.try_acquire_buffer(length)? {
+                        Some(buf) => buf,
+                        // The budget has nothing spare. Carry on with whatever is already
+                        // posted rather than blocking for memory while holding some, which is
+                        // how concurrent transfers deadlock each other.
+                        None if !posted.is_empty() => break,
+                        // Nothing is posted, so there is no progress to make without a window
+                        // and no registration held that another transfer could be waiting on.
+                        None => fabric.acquire_buffer(length).await?,
+                    }
+                }
+            };
+            let window_count =
+                (chunk_count - posted_chunk).min(ready.max_inflight_chunks as u64) as u32;
+            let window_piece_offset = posted_chunk * ready.chunk_size;
+            let mut window_length = 0usize;
+            let mut ops = Vec::with_capacity(window_count as usize);
 
-        for chunk in start_chunk..start_chunk + u64::from(window_count) {
-            let piece_offset = chunk * ready.chunk_size;
-            let local_offset = usize::try_from(piece_offset - window_piece_offset)
-                .map_err(|_| ClientError::InvalidParameter)?;
-            let len = ready.chunk_size.min(ready.length - piece_offset);
-            let len = usize::try_from(len).map_err(|_| ClientError::InvalidParameter)?;
-            window_length = window_length
-                .checked_add(len)
-                .ok_or(ClientError::InvalidParameter)?;
-            ops.push((
-                len,
-                fabric
-                    .post_recv(window_buf.buffer(), local_offset, len, tag + chunk)
-                    .await?,
-            ));
+            for chunk in posted_chunk..posted_chunk + u64::from(window_count) {
+                let piece_offset = chunk * ready.chunk_size;
+                let local_offset = usize::try_from(piece_offset - window_piece_offset)
+                    .map_err(|_| ClientError::InvalidParameter)?;
+                let len = ready.chunk_size.min(ready.length - piece_offset);
+                let len = usize::try_from(len).map_err(|_| ClientError::InvalidParameter)?;
+                window_length = window_length
+                    .checked_add(len)
+                    .ok_or(ClientError::InvalidParameter)?;
+                ops.push((
+                    len,
+                    fabric
+                        .post_recv(window_buf.buffer(), local_offset, len, tag + chunk)
+                        .await?,
+                ));
+            }
+
+            write_frame(
+                &mut writer,
+                &Frame::RecvPosted {
+                    start_chunk: posted_chunk,
+                    chunk_count: window_count,
+                },
+            )
+            .await?;
+
+            debug_assert_eq!(window_length, window_buf.len());
+            posted.push_back(PostedWindow {
+                buf: window_buf,
+                ops,
+                chunk_count: window_count,
+            });
+            posted_chunk += u64::from(window_count);
         }
 
-        write_frame(
-            &mut writer,
-            &Frame::RecvPosted {
-                start_chunk,
-                chunk_count: window_count,
-            },
-        )
-        .await?;
-
-        for (expected_len, op) in ops {
+        let window = posted.pop_front().expect("posted receive window");
+        for (expected_len, op) in window.ops {
             let wait = fabric.wait(op, transfer_timeout);
             tokio::pin!(wait);
             let len = if server_done {
@@ -507,7 +572,11 @@ async fn receive_stream(
                                     err.message
                                 )));
                             }
-                            Ok(Frame::Done) if final_window => {
+                            // The parent sends Done once every chunk has been handed to the
+                            // fabric, which it can only reach after the last RecvPosted. Nothing
+                            // orders that frame against the remaining local completions, so Done
+                            // is legitimate here whenever every window has been posted.
+                            Ok(Frame::Done) if posted_chunk == chunk_count => {
                                 server_done = true;
                                 wait.await?
                             }
@@ -530,25 +599,11 @@ async fn receive_stream(
             }
         }
 
-        debug_assert_eq!(window_length, window_buf.len());
-        if window_tx.send(Ok(window_buf)).await.is_err() {
+        drained_chunk += u64::from(window.chunk_count);
+        if window_tx.send(Ok(window.buf)).await.is_err() {
             return Err(ClientError::Unknown(
                 "rdma stream consumer closed early".to_string(),
             ));
-        }
-        start_chunk += u64::from(window_count);
-        if start_chunk < chunk_count {
-            let next_length = ready
-                .length
-                .saturating_sub(start_chunk.saturating_mul(ready.chunk_size))
-                .min(
-                    ready
-                        .chunk_size
-                        .saturating_mul(u64::from(ready.max_inflight_chunks)),
-                );
-            let next_length =
-                usize::try_from(next_length).map_err(|_| ClientError::InvalidParameter)?;
-            next_buf = Some(fabric.acquire_buffer(next_length).await?);
         }
     }
 

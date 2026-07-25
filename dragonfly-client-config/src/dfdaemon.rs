@@ -40,7 +40,7 @@ use tonic::transport::{
     Certificate as TonicCertificate, ClientTlsConfig, Identity, ServerTlsConfig,
 };
 use tracing::{error, instrument};
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 /// NAME is the name of dfdaemon.
 pub const NAME: &str = "dfdaemon";
@@ -1026,6 +1026,7 @@ impl fmt::Display for RdmaProvider {
 /// `enable` are also used by an RDMA downloader; `enable` controls only whether this daemon serves
 /// pieces over RDMA. The TCP storage server remains required for discovery and per-piece fallback.
 #[derive(Debug, Clone, Validate, Deserialize)]
+#[validate(schema(function = "validate_rdma_server", skip_on_field_errors = true))]
 #[serde(default, rename_all = "camelCase")]
 pub struct RdmaServer {
     /// Enable serving pieces over RDMA. Downloading is selected independently with
@@ -1097,6 +1098,56 @@ pub struct RdmaServer {
     /// failures fall back to the streaming reader. Cache-resident pieces always use the reader.
     #[serde(default)]
     pub mmap_content: bool,
+}
+
+/// RDMA_MIN_CHUNK_SIZE is the smallest tagged message the transport will use. Below this the
+/// per-operation posting and completion cost dominates the transfer, and a piece is split into
+/// enough chunks to exhaust the endpoint's queues.
+const RDMA_MIN_CHUNK_SIZE: ByteSize = ByteSize::kib(64);
+
+/// RDMA_MAX_CHUNK_SIZE bounds one tagged message. Providers cap the message size themselves and
+/// the transport clamps to that at runtime; this catches an unreasonable value at load time.
+const RDMA_MAX_CHUNK_SIZE: ByteSize = ByteSize::gib(1);
+
+/// RDMA_MIN_TRANSFER_TIMEOUT is the shortest fabric operation timeout that is not self-defeating.
+/// The timeout covers a whole window reaching the peer, so a value below this turns every large
+/// transfer into a cancellation and a TCP fallback.
+const RDMA_MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// RDMA_MAX_TRANSFER_TIMEOUT bounds how long a stuck transfer can pin registered memory before it
+/// is abandoned in favour of TCP.
+const RDMA_MAX_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// validate_rdma_server rejects RDMA settings that are individually parseable but cannot work
+/// together. The important one is the last check: a registration budget smaller than a single
+/// transfer window admits no transfer at all, so every piece would pay a rendezvous round trip
+/// and a rejection before falling back to TCP.
+fn validate_rdma_server(rdma: &RdmaServer) -> std::result::Result<(), ValidationError> {
+    if rdma.chunk_size < RDMA_MIN_CHUNK_SIZE || rdma.chunk_size > RDMA_MAX_CHUNK_SIZE {
+        return Err(ValidationError::new(
+            "chunkSize must be between 64KiB and 1GiB",
+        ));
+    }
+
+    if rdma.transfer_timeout < RDMA_MIN_TRANSFER_TIMEOUT
+        || rdma.transfer_timeout > RDMA_MAX_TRANSFER_TIMEOUT
+    {
+        return Err(ValidationError::new(
+            "transferTimeout must be between 1s and 10m",
+        ));
+    }
+
+    let window = rdma
+        .chunk_size
+        .as_u64()
+        .saturating_mul(u64::from(rdma.max_inflight_chunks));
+    if rdma.max_registered_bytes.as_u64() < window {
+        return Err(ValidationError::new(
+            "maxRegisteredBytes must be at least chunkSize * maxInflightChunks",
+        ));
+    }
+
+    Ok(())
 }
 
 /// RdmaServer implements Default.
@@ -2392,6 +2443,51 @@ key: /etc/ssl/private/client.pem
             ..Default::default()
         };
         assert!(rdma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_rdma_chunk_size() {
+        for chunk_size in [ByteSize::b(0), ByteSize::kib(32), ByteSize::gib(2)] {
+            let rdma = RdmaServer {
+                chunk_size,
+                max_registered_bytes: ByteSize::gib(64),
+                ..Default::default()
+            };
+            assert!(rdma.validate().is_err(), "accepted chunk size {chunk_size}");
+        }
+    }
+
+    #[test]
+    fn reject_invalid_rdma_transfer_timeout() {
+        for transfer_timeout in [Duration::from_millis(0), Duration::from_secs(601)] {
+            let rdma = RdmaServer {
+                transfer_timeout,
+                ..Default::default()
+            };
+            assert!(
+                rdma.validate().is_err(),
+                "accepted transfer timeout {transfer_timeout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_rdma_registration_budget_below_one_window() {
+        // A budget this small rejects every transfer at admission, so RDMA would cost a round
+        // trip per piece and never carry one.
+        let rdma = RdmaServer {
+            chunk_size: ByteSize::mib(4),
+            max_inflight_chunks: 16,
+            max_registered_bytes: ByteSize::mib(32),
+            ..Default::default()
+        };
+        assert!(rdma.validate().is_err());
+
+        let rdma = RdmaServer {
+            max_registered_bytes: ByteSize::mib(64),
+            ..rdma
+        };
+        assert!(rdma.validate().is_ok());
     }
 
     #[test]

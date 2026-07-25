@@ -27,7 +27,7 @@ use dragonfly_client_storage::client::rdma::{discover, RDMAClient};
 use dragonfly_client_storage::rdma::fabric::Fabric;
 use dragonfly_client_storage::rdma::rendezvous::{
     read_frame, write_frame, CapabilityRegistry, Frame, PieceKind, PieceReady, PieceRequest,
-    RendezvousError, WireCapability, ERROR_CODE_INTERNAL,
+    RendezvousError, WireCapability, ERROR_CODE_BUSY, ERROR_CODE_INTERNAL,
 };
 use dragonfly_client_storage::server::{rdma::RDMAServer, tcp::TCPServer};
 use dragonfly_client_storage::Storage;
@@ -35,6 +35,7 @@ use dragonfly_client_util::{id_generator::IDGenerator, shutdown};
 use leaky_bucket::RateLimiter;
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -45,12 +46,23 @@ use tokio::sync::mpsc;
 const FABRIC_TAG: &str = "test-fabric";
 
 /// free_port grabs an ephemeral TCP port for the rendezvous listener.
+/// NEXT_TEST_PORT hands out ports from a range the OS does not use for ephemeral allocation.
+///
+/// Binding to port 0 and closing the socket is not enough here: the kernel readily hands the same
+/// port to the next probe, so two tests running in parallel can be told to use it and whichever
+/// server binds second fails with `AddrInUse`. A counter that never repeats removes that race
+/// between tests in this process.
+static NEXT_TEST_PORT: AtomicU16 = AtomicU16::new(21000);
+
+/// free_port returns a port no other test in this process has been given, and that is bindable now.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    for _ in 0..1000 {
+        let port = NEXT_TEST_PORT.fetch_add(1, Ordering::Relaxed);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port available for test");
 }
 
 /// test_config builds a config with the RDMA transport enabled.
@@ -67,12 +79,7 @@ fn test_config() -> Config {
 /// assign_free_ports gives the TCP discovery and RDMA rendezvous listeners distinct ports.
 fn assign_free_ports(config: &mut Config) {
     config.storage.server.rdma.port = free_port();
-    loop {
-        config.storage.server.tcp_port = free_port();
-        if config.storage.server.tcp_port != config.storage.server.rdma.port {
-            break;
-        }
-    }
+    config.storage.server.tcp_port = free_port();
 }
 
 /// write_piece stores one finished piece and returns its digest.
@@ -820,19 +827,50 @@ async fn rejects_connections_over_the_transfer_admission_limit() {
         .await
         .unwrap(),
     );
+    let task_id = "f869ba82f1ba1c1c5eb27f0b7aa051dcaf72e9a8dd574a04e60247f8d0a5f2b4";
+    write_piece(&storage, task_id, 0, &[0x31; 8192]).await;
     let (_tcp_addr, addr, shutdown, _shutdown_complete_rx) = start_server(config, storage).await;
 
-    // The first idle connection consumes the sole admission permit while it waits for a frame.
-    let _held = tokio::net::TcpStream::connect(&addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Take the sole admission permit, and read far enough to know the server has it. Merely
+    // opening a connection would leave the test racing the accept loop.
+    let (fabric, capability) = client_fabric(FABRIC_TAG);
+    let held = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let (mut held_reader, mut held_writer) = held.into_split();
+    write_frame(
+        &mut held_writer,
+        &Frame::Request(PieceRequest {
+            kind: PieceKind::Piece,
+            task_id: task_id.to_string(),
+            piece_number: 0,
+            capability,
+            client_endpoint: fabric.local_endpoint().to_vec(),
+            tag: fabric.next_tag().unwrap(),
+            chunk_size: 4096,
+            max_inflight_chunks: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut held_reader).await.unwrap(),
+        Frame::Ready(_)
+    ));
 
-    // The listener accepts and closes overload rather than spawning an unbounded waiting task.
+    // The listener rejects overload rather than spawning an unbounded waiting task, and says so
+    // explicitly: a bare close would look to the client like a parent whose fabric is broken.
     let second = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let (mut reader, _writer) = second.into_split();
-    let result = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader))
+    let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader))
         .await
-        .expect("over-limit connection should be closed immediately");
-    assert!(result.is_err());
+        .expect("over-limit connection should be answered immediately")
+        .unwrap();
+    match frame {
+        Frame::Error(err) => {
+            assert_eq!(err.code, ERROR_CODE_BUSY);
+            assert!(err.message.contains("admission"));
+        }
+        frame => panic!("expected Error, got {frame:?}"),
+    }
 
     shutdown.trigger();
 }

@@ -1,5 +1,7 @@
 # RDMA P2P Optimization Plan
 
+> Work currently in flight, and the one measurement still missing, are tracked in `RDMA-WIP.md`.
+
 ## Goal
 
 Increase complete Dragonfly piece-transfer goodput and concurrency while keeping RDMA optional,

@@ -2,16 +2,22 @@
 # Recreates the two hostNetwork bench pods on the GPU nodes and installs everything the harness
 # needs: libfabric with its verbs provider, the ibverbs device plugins, and a large tmpfs.
 #
-# hostNetwork is required because the RoCE devices are not exposed to the pod network namespace,
+# hostNetwork is required because the RDMA devices are not exposed to the pod network namespace,
 # and IPC_LOCK is required to pin registered memory. The pods hold no state, so re-running this is
 # the fastest way to recover from a lost pod.
 #
 # SRV_NODE and CLI_NODE are cluster-specific and must be set for anything but the cluster these
 # results were taken on. They must be two different nodes on the same fabric.
+#
+# This provisions its own pods for a RoCE cluster. On AWS EFA the node image already carries AWS's
+# libfabric, and a pod built from a different libfabric will not talk to the device, so there run
+# the harness inside the existing GPU pods and skip straight to deploy.sh.
 set -euo pipefail
 
-SRV_NODE=${SRV_NODE:-chi3-en11-13-s1}
-CLI_NODE=${CLI_NODE:-chi3-en11-3-s1}
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
+
+SRV_NODE=${SRV_NODE:?set SRV_NODE to the node hosting the server pod}
+CLI_NODE=${CLI_NODE:?set CLI_NODE to a different node on the same fabric}
 MEMFS_SIZE=${MEMFS_SIZE:-220G}
 
 create_pod() {
@@ -55,22 +61,23 @@ provision_pod() {
     apt-get update -qq
     apt-get install -y -qq libfabric1 libfabric-bin libibverbs1 ibverbs-providers \
       librdmacm1 ibverbs-utils rdmacm-utils >/dev/null
-    mkdir -p /bench/bin /mnt/memfs
-    mountpoint -q /mnt/memfs || mount -t tmpfs -o size=${MEMFS_SIZE} tmpfs /mnt/memfs
+    mkdir -p ${BENCH_DIR}/bin ${MEMFS}
+    mountpoint -q ${MEMFS} || mount -t tmpfs -o size=${MEMFS_SIZE} tmpfs ${MEMFS}
   "
 
   echo "--- ${name}: fabric providers ---"
-  kubectl exec "$name" -- bash -lc 'fi_info -p verbs 2>&1 | grep -E "provider|domain" | head -4'
+  kubectl exec "$name" -- bash -lc "fi_info -p ${PROVIDER} 2>&1 | grep -E 'provider|domain' | head -4"
   kubectl exec "$name" -- bash -lc 'ibv_devinfo | grep -E "hca_id|state:" | head -4'
 }
 
-create_pod rdma-df-srv "$SRV_NODE"
-create_pod rdma-df-cli "$CLI_NODE"
-provision_pod rdma-df-srv
-provision_pod rdma-df-cli
+create_pod "$SRV_POD" "$SRV_NODE"
+create_pod "$CLI_POD" "$CLI_NODE"
+provision_pod "$SRV_POD"
+provision_pod "$CLI_POD"
 
 echo
 echo "setup complete. next:"
 echo "  ./deploy.sh"
-echo "  kubectl exec rdma-df-srv -- /bench/gen-llama-13b.sh /mnt/memfs/llama-2-13b-chat-hf"
-echo "  FILES_DIR=/mnt/memfs/llama-2-13b-chat-hf DATA_DIR=/mnt/memfs/df-data ./server.sh"
+echo "  kubectl exec $SRV_POD -- $BENCH_DIR/gen-llama-13b.sh $MEMFS/llama-2-13b-chat-hf"
+echo "  FILES_DIR=$MEMFS/llama-2-13b-chat-hf DATA_DIR=$MEMFS/df-data ./server.sh"
+echo "  TASK_ID=... MANIFEST_PIECE=... ./compare.sh"

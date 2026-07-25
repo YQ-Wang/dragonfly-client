@@ -147,6 +147,20 @@ libfabric。直接注册需要进一步解决：
 7. 消费完的注册 buffer 返回 buffer pool；
 8. 后台继续接收后续窗口。
 
+### 接收窗口流水线
+
+Parent 在收到某个窗口的 `RecvPosted` 之前不能发送该窗口。如果客户端一次只 post 一个窗口，
+那么在窗口 N 的最后一个 completion 和窗口 N+1 的 `RecvPosted` 到达 Parent 之间，fabric
+上没有任何已 post 的接收，Parent 只能空等一个控制面 RTT。这也让 Parent 的双窗口发送环失去
+意义：它已经从 storage 填好了下一个窗口，却无处可发。
+
+因此客户端同时保持 `RECEIVE_PIPELINE_DEPTH`（当前为 2）个窗口处于 posted 状态，并把两个
+`RecvPosted` 连续写入控制连接。Parent 顺序读取这两帧，发完窗口 N 后可以立即发窗口 N+1，
+不再有窗口之间的空档。
+
+第二个窗口通过 `Fabric::try_acquire_buffer` 申请：注册内存预算不足时返回 `None`，该传输退回
+到一次一个窗口，而不是在已经持有注册内存的情况下等待更多内存——后者会让并发传输互相死锁。
+
 由此可以重叠：
 
 ```text
@@ -210,6 +224,23 @@ RDMA 是可选优化，TCP 始终保留。
 
 regular、persistent 和 persistent-cache 三种 piece namespace 使用相同策略。
 
+### Parent 退避
+
+只做单次 fallback 是不够的。一个 RDMA 坏掉但 TCP 正常的 Parent，如果每个 piece 都重新
+discovery、重新尝试 RDMA、再 fallback，那么 RDMA 带来的就只有额外的往返开销。
+
+因此下载端为每个 Parent 维护一个惩罚窗口，两类失败区别对待：
+
+- **不兼容**（provider 或 `fabricTag` 不匹配）是稳定事实，直接跳过该 Parent 60s；
+- **传输失败**（不可达、Parent 达到 admission 上限、传输中断）可能是瞬时的，从 2s 开始
+  按指数退避，上限 60s。
+
+一次成功的传输会清除惩罚记录。惩罚过期后条目仍然保留，因此持续失败的 Parent 不会因为每次
+重试而被重置回最短退避。
+
+Parent 达到 `maxConcurrentTransfers` 时会回复 `ERROR_CODE_BUSY` 而不是直接关闭连接：直接
+关闭在客户端看来与 fabric 坏掉无法区分，会让一个只是繁忙的 Parent 被当作不可用。
+
 ## 资源边界和安全性
 
 当前实现包含以下边界：
@@ -222,6 +253,17 @@ regular、persistent 和 persistent-cache 三种 piece namespace 使用相同策
 - malformed frame、乱序窗口和超限参数会 fail closed；
 - endpoint 失败后会被 retire，后续请求重新创建 fabric；
 - buffer 只有在所有 completion 被回收后才能复用。
+
+配置在加载时校验，避免一组单独合法、组合起来无法工作的参数：`chunkSize` 必须在 64KiB 到
+1GiB 之间，`transferTimeout` 必须在 1s 到 10m 之间，`maxRegisteredBytes` 至少要能放下一个
+窗口（`chunkSize * maxInflightChunks`）。最后一条最重要：预算小于一个窗口时任何传输都会在
+admission 阶段被拒绝，RDMA 只会给每个 piece 增加一次往返而永远不承载数据。
+
+retire 路径不假设 `fi_close` 对所有 provider 都是 DMA barrier。libfabric 并不做这个保证，
+它要求应用在关闭前完成或取消所有 operation——而 retire 恰恰发生在无法取消的时候。因此只有
+已知在关闭 endpoint 时会拆除队列对（`efa`、`verbs`）或根本不涉及设备 DMA（`tcp`、`udp`、
+`sockets`、`shm`）的 provider 才会释放在途 buffer；其余 provider 一律隔离这些注册内存直到
+进程结束。
 
 ## 主要配置
 
@@ -281,10 +323,18 @@ storage:
 工作负载在内存文件系统上已达到 51–54 Gbps。另外 `TCP tar baseline` 也不是 dfdaemon TCP piece
 路径的对照，因此这张表无法回答"RDMA 比 TCP 快多少"。要重新引用 EFA 结果，需要用当前 harness 重测。
 
+### 与 TCP 的对照
+
+harness 现在支持 `--transport tcp`：同一批 piece、同一个 Parent、同样的 digest 与 sink，只是改从
+Vortex TCP piece server 取数据。`scripts/rdma-bench/compare.sh` 在一组并发下交替跑两种传输并列出
+对比。硬件对照数据尚未采集（EFA 节点当前因 GPU 容量不足无法调度），进展记录在
+`RDMA-ONPREM-VALIDATION.md`。
+
 ## 尚未实现
 
 - batch post 和 reusable context slab；
 - completion 的窗口级批量等待；
+- 接收流水线深度可配置（当前固定为 2 个窗口）；
 - multi-rail 和 piece-level rail 分配；
 - NUMA-local buffer allocation 和 progress thread 绑定；
 - mmap 页面直接注册（已评估并暂缓：在同时跑训练的节点上会 pin page cache 并占用与 NCCL 共享的

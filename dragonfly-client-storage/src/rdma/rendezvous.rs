@@ -64,6 +64,11 @@ pub const ERROR_CODE_INTERNAL: u32 = 3;
 /// ERROR_CODE_TOO_LARGE means the piece exceeds the parent's transfer limits.
 pub const ERROR_CODE_TOO_LARGE: u32 = 4;
 
+/// ERROR_CODE_BUSY means the parent is already serving as many RDMA transfers as it admits. The
+/// client should fall back to TCP for this piece, and unlike the other codes this says nothing
+/// about whether the parent can serve RDMA at all.
+pub const ERROR_CODE_BUSY: u32 = 5;
+
 /// PieceKind selects which piece namespace a request addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceKind {

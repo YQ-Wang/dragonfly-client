@@ -206,6 +206,34 @@ struct Handle {
     raw: *mut ffi::DfrdmaFabric,
     endpoint_lifecycle: RwLock<()>,
     endpoint_open: AtomicBool,
+
+    /// endpoint_close_drains records whether closing the endpoint is known to stop the device
+    /// from writing into buffers that were posted to it. See [`endpoint_close_drains`].
+    endpoint_close_drains: bool,
+}
+
+/// endpoint_close_drains reports whether `fi_close` on an endpoint of this provider is a hardware
+/// barrier: after it returns, nothing can still land in a buffer that was posted to that endpoint.
+///
+/// libfabric does not promise this in general. It asks the application to complete or cancel every
+/// operation before closing, and leaves the behaviour of closing with work outstanding to the
+/// provider. The abort path needs the opposite guarantee, because it runs precisely when an
+/// operation could not be cancelled, so it has to know the answer per provider rather than assume
+/// one:
+///
+///   - `efa` and `verbs` close the endpoint by destroying the underlying queue pair. The kernel
+///     driver takes the queue pair out of service before `ibv_destroy_qp` returns, so the NIC can
+///     no longer reach the posted buffers.
+///   - `tcp`, `udp`, `sockets` and `shm` are software providers. No device DMA is involved, and
+///     closing the endpoint tears down the socket the progress thread was using.
+///
+/// Anything else is treated as unknown, and the abort path quarantines the buffers instead of
+/// freeing them. That leaks the in-flight registrations for the life of the process, which is the
+/// correct trade against handing memory back to the allocator while a device may still write it.
+fn endpoint_close_drains(provider: &str) -> bool {
+    // Providers are reported as either a bare name or "base;layered", e.g. "verbs;ofi_rxm".
+    let base = provider.split(';').next().unwrap_or(provider);
+    matches!(base, "efa" | "verbs" | "tcp" | "udp" | "sockets" | "shm")
 }
 
 /// Safety: the shim rejects providers that do not grant FI_THREAD_SAFE, and the handle is
@@ -305,10 +333,16 @@ impl FabricInner {
         error!("retiring rdma fabric: {}", reason);
 
         let _progress_guard = self.cancel_progress_lock.lock().unwrap();
-        if self.handle.close_endpoint() {
-            // Closing the endpoint is the EFA-supported way to abort posted receives. Once it
-            // succeeds the NIC can no longer access these contexts or buffers.
+        let closed = self.handle.close_endpoint();
+        if closed && self.handle.endpoint_close_drains {
+            // Closing the endpoint is the supported way to abort posted receives on this
+            // provider, and it has returned, so nothing can reach these buffers any more.
             self.pending.lock().unwrap().clear();
+        } else if closed {
+            error!(
+                "rdma endpoint closed but this provider does not guarantee the device has stopped; \
+                 pending buffers remain quarantined for process lifetime"
+            );
         } else {
             error!(
                 "rdma endpoint close failed; pending buffers remain quarantined for process lifetime"
@@ -349,13 +383,17 @@ impl FabricInner {
 
 impl Drop for FabricInner {
     fn drop(&mut self) {
-        if self.handle.endpoint_open.load(Ordering::Acquire) {
-            let pending = std::mem::take(self.pending.get_mut().unwrap());
-            if !pending.is_empty() {
-                // Endpoint close failed, so the provider may still own these buffers. Leaking
-                // the pending map also retains Handle and is safer than freeing DMA memory.
-                std::mem::forget(pending);
-            }
+        let pending = std::mem::take(self.pending.get_mut().unwrap());
+        if !pending.is_empty() {
+            // A shutdown that reached the provider empties this map, so anything left here is an
+            // operation the provider never gave back: either the endpoint would not close or the
+            // provider does not promise the device stops when it does. Leaking the map also
+            // retains Handle, and is safer than returning memory a device may still write.
+            error!(
+                "leaking {} in-flight rdma registrations that the provider never released",
+                pending.len()
+            );
+            std::mem::forget(pending);
         }
     }
 }
@@ -842,6 +880,7 @@ impl Fabric {
             raw: handle,
             endpoint_lifecycle: RwLock::new(()),
             endpoint_open: AtomicBool::new(true),
+            endpoint_close_drains: endpoint_close_drains(&provider_name),
         });
         let inner = Arc::new(FabricInner {
             cancel_progress_lock: Mutex::new(()),
@@ -908,6 +947,13 @@ impl Fabric {
         self.pool.stats()
     }
 
+    /// registered_budget_bytes returns the ceiling on bytes held by active and pooled buffers
+    /// together. Callers use it to decide how many buffers to hold at once, since
+    /// [`Fabric::acquire_buffer`] blocks rather than reporting that the budget is spent.
+    pub fn registered_budget_bytes(&self) -> u64 {
+        u64::from(self.budget_permits) * BUDGET_UNIT
+    }
+
     /// next_tag reserves a disjoint block of tags for one transfer. Exhaustion fails closed
     /// instead of wrapping into a block that may still belong to an in-flight transfer.
     pub fn next_tag(&self) -> Result<u64> {
@@ -924,6 +970,48 @@ impl Fabric {
     pub async fn alloc_buffer(&self, len: usize) -> Result<Arc<PinnedBuf>> {
         let mut pooled = self.acquire_buffer(len).await?;
         Ok(pooled.buf.take().expect("pooled buffer"))
+    }
+
+    /// try_acquire_buffer checks out a best-fit registered buffer only if one is available right
+    /// now, returning None instead of waiting.
+    ///
+    /// A caller that already holds a buffer must use this rather than [`Fabric::acquire_buffer`].
+    /// Waiting for budget while holding a registration is how several transfers deadlock each
+    /// other: each holds part of the budget and blocks for the rest. Returning None lets the
+    /// caller proceed with what it has.
+    pub fn try_acquire_buffer(&self, len: usize) -> Result<Option<PooledBuf>> {
+        if len == 0 {
+            return Err(Error::InvalidParameter);
+        }
+        let permits = self.buffer_permits(len)?;
+        self.inner.ensure_healthy()?;
+        if self.pool.closed.load(Ordering::Acquire) {
+            return Err(Error::Unknown("rdma fabric is shut down".to_string()));
+        }
+
+        if let Some(buf) = self.pool.take_best_fit(len) {
+            return Ok(Some(PooledBuf {
+                buf: Some(buf),
+                pool: self.pool.clone(),
+                logical_len: len,
+            }));
+        }
+
+        match self.budget.clone().try_acquire_many_owned(permits) {
+            Ok(permit) => {
+                let buf = self.register_buffer(len, permit)?;
+                self.pool.misses.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(PooledBuf {
+                    buf: Some(buf),
+                    pool: self.pool.clone(),
+                    logical_len: len,
+                }))
+            }
+            Err(TryAcquireError::Closed) => {
+                Err(Error::Unknown("rdma fabric is shut down".to_string()))
+            }
+            Err(TryAcquireError::NoPermits) => Ok(None),
+        }
     }
 
     /// acquire_buffer checks out a best-fit registered buffer. It waits for either a returned
@@ -1535,6 +1623,32 @@ mod tests {
         let stats = fabric.buffer_pool_stats();
         assert_eq!(stats.cached_buffers, 1);
         assert_eq!(stats.cached_bytes, 4096);
+    }
+
+    #[test]
+    fn only_known_providers_treat_endpoint_close_as_a_dma_barrier() {
+        for provider in ["efa", "verbs", "verbs;ofi_rxm", "tcp", "shm"] {
+            assert!(endpoint_close_drains(provider), "{provider}");
+        }
+        for provider in ["cxi", "opx", "psm3", ""] {
+            assert!(!endpoint_close_drains(provider), "{provider}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_buffer_reports_an_exhausted_budget_instead_of_waiting() {
+        let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
+        assert_eq!(fabric.registered_budget_bytes(), 1024 * 1024);
+
+        let held = fabric.try_acquire_buffer(1024 * 1024).unwrap();
+        assert!(held.is_some());
+
+        // The budget is spent, so a caller already holding a registration is told so rather than
+        // being parked while it holds memory another transfer is waiting for.
+        assert!(fabric.try_acquire_buffer(1024 * 1024).unwrap().is_none());
+
+        drop(held);
+        assert!(fabric.try_acquire_buffer(1024 * 1024).unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

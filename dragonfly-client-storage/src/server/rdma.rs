@@ -19,7 +19,7 @@ use crate::content::MappedPiece;
 use crate::rdma::fabric::Fabric;
 use crate::rdma::rendezvous::{
     read_frame, write_frame, CapabilityRegistry, Frame, PieceKind, PieceReady, PieceRequest,
-    RdmaAdvertisement, RendezvousError, WireCapability, ERROR_CODE_INCOMPATIBLE,
+    RdmaAdvertisement, RendezvousError, WireCapability, ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE,
     ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
 use crate::Storage;
@@ -212,9 +212,28 @@ impl RDMAServer {
 
                     let Ok(admission) = transfer_admission.clone().try_acquire_owned() else {
                         debug!(
-                            "rdma rendezvous admission full, closing connection from {}",
+                            "rdma rendezvous admission full, rejecting connection from {}",
                             remote_address
                         );
+                        // Dropping the socket here would surface on the client as a connection
+                        // reset, which is indistinguishable from a parent whose fabric is broken.
+                        // Saying "busy" instead lets the client fall back to TCP for this piece
+                        // and keep treating the parent as RDMA-capable.
+                        let reject_timeout = rdma_config.transfer_timeout;
+                        tokio::spawn(async move {
+                            let (_, mut writer) = tcp.into_split();
+                            let _ = time::timeout(
+                                reject_timeout,
+                                write_frame(
+                                    &mut writer,
+                                    &Frame::Error(RendezvousError {
+                                        code: ERROR_CODE_BUSY,
+                                        message: "rdma transfer admission is full".to_string(),
+                                    }),
+                                ),
+                            )
+                            .await;
+                        });
                         continue;
                     };
                     let handler = handler.clone();
@@ -486,11 +505,28 @@ impl RDMAServerHandler {
         let staging_length = usize::try_from(staging_length).map_err(|_| {
             ClientError::Unknown("rdma staging ring exceeds addressable memory".to_string())
         })?;
-        let mut buf = match self.fabric.acquire_buffer(staging_length).await {
-            Ok(buf) => buf,
-            Err(err) => {
+        // The registration budget is shared across concurrent transfers, so this can block behind
+        // peers rather than return. Without a bound the task would sit here holding an admission
+        // slot until the client's own timeout fired, which turns budget pressure into a slow
+        // shrink of the server's effective concurrency.
+        let acquired = time::timeout(
+            self.transfer_timeout,
+            self.fabric.acquire_buffer(staging_length),
+        )
+        .await;
+        let mut buf = match acquired {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(err)) => {
                 self.abort(writer, ERROR_CODE_TOO_LARGE, err.to_string())
                     .await?;
+                return Err(err);
+            }
+            Err(_) => {
+                let err = ClientError::Unknown(format!(
+                    "rdma registration budget unavailable after {:?}",
+                    self.transfer_timeout
+                ));
+                self.abort(writer, ERROR_CODE_BUSY, err.to_string()).await?;
                 return Err(err);
             }
         };

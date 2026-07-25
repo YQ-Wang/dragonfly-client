@@ -98,6 +98,35 @@ is marked failed and restarted before the error propagates, which lets the TCP r
 range from the start. This preserves the plan's constraint that TCP fallback stays available until
 an RDMA transfer has completed successfully.
 
+## RDMA against TCP
+
+The earlier version of this document compared RDMA against a 314 Gbps `iperf3` number, which was
+not a fair baseline: raw sockets with no piece protocol and no filesystem is not what RDMA replaces.
+What RDMA replaces is the TCP piece server, so the harness now drives both.
+
+`--transport tcp` downloads the same seeded pieces from the same parent over the Vortex piece
+server, and hands the received bytes to the same digest and the same sink, batched into the same
+sized blocks as an RDMA receive window. The only difference left is how bytes arrive: a tagged
+fabric message written by the NIC into registered memory, or a socket read into a buffer. Run it
+with `scripts/rdma-bench/compare.sh`, which alternates the two transports at each concurrency so
+that a drifting machine shows up as noise in both columns rather than as a win for whichever ran
+first.
+
+Two things decide what the comparison can show, and both are properties of the workload rather than
+of the transport:
+
+- **Concurrency.** One stream is latency-bound and understates RDMA. Enough streams saturate the
+  link on either transport and understate it again. The gap is widest in between.
+- **What touches the bytes.** At `DIGEST=crc32 SINK=pwrite` the receiver spends most of its time in
+  the digest and the write, which are identical on both transports, so the end-to-end ratio is much
+  smaller than the transport ratio. `DIGEST=none SINK=null` isolates the transports; the honest
+  summary quotes both.
+
+> **Status.** The comparison has not been run on hardware yet. The EFA nodes this was to run on are
+> unschedulable for want of GPU capacity, and neither of the two hosts otherwise available carries
+> an RDMA device. The harness path itself is exercised: both transports complete and verify the same
+> dataset over the libfabric software provider. Numbers go here once the nodes come back.
+
 ## What was tried and rejected
 
 **Sharding one window across several `pwrite` threads.** The write stage runs at about one core's
@@ -114,9 +143,6 @@ reverted rather than left behind a tuning knob whose best value is "off".
 
 Read the numbers above with these gaps in mind:
 
-- **No TCP comparison through the same path.** The 314 Gbps `iperf3` figure is raw sockets with no
-  piece protocol and no filesystem, so it is not a baseline for "how much faster is RDMA than TCP
-  for a model download". Answering that needs the same harness driven over the TCP piece server.
 - **One piece per file.** The harness maps each file to a single piece, whereas `dfdaemon` splits a
   file into many pieces and downloads them concurrently. Real `dfdaemon` therefore gets parallelism
   within one large file that this harness does not, so its aggregate on 3 shards should exceed the
@@ -173,4 +199,12 @@ DIGEST=crc32 ./client.sh               # dfdaemon-equivalent goodput
 DIGEST=none SINK=null ./client.sh      # transport ceiling
 SINK=tokio DIGEST=crc32 ./client.sh    # the tokio::fs write path, for the A/B above
 CONCURRENCY=1 DIGEST=crc32 ./client.sh # per-stream goodput
+TRANSPORT=tcp ./client.sh              # the same workload over the TCP piece server
+
+# RDMA against TCP across a concurrency sweep.
+./compare.sh                           # dfdaemon-equivalent, both transports
+DIGEST=none SINK=null ./compare.sh     # transports only, nothing touching the bytes
 ```
+
+`scripts/rdma-bench/README.md` documents the scripts and the environment variables that point them
+at an EFA cluster instead of a RoCE one.

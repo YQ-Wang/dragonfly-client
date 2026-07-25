@@ -8,7 +8,10 @@
 
 use bytesize::ByteSize;
 use dragonfly_client_config::dfdaemon::{Config, RdmaProvider};
-use dragonfly_client_storage::client::rdma::{discover, RDMAClient};
+use dragonfly_client_storage::client::rdma::{
+    discover, RDMAClient, RDMAStreamReader, ReceivedWindow,
+};
+use dragonfly_client_storage::client::tcp::TCPClient;
 use dragonfly_client_storage::rdma::fabric::Fabric;
 use dragonfly_client_storage::rdma::rendezvous::{CapabilityRegistry, WireCapability};
 use dragonfly_client_storage::server::{rdma::RDMAServer, tcp::TCPServer};
@@ -17,13 +20,14 @@ use dragonfly_client_util::digest::{calculate_file_digest, Algorithm, Digest};
 use dragonfly_client_util::{id_generator::IDGenerator, shutdown};
 use leaky_bucket::RateLimiter;
 use sha2::{Digest as Sha2Digest, Sha256};
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -96,6 +100,7 @@ struct Args {
     concurrency: usize,
     digest: DigestAlgorithm,
     sink: Sink,
+    transport: Transport,
     files_dir: PathBuf,
     out_dir: PathBuf,
     data_dir: PathBuf,
@@ -116,6 +121,7 @@ fn parse_args() -> Args {
         concurrency: 2,
         digest: DigestAlgorithm::Sha256,
         sink: Sink::Pwrite,
+        transport: Transport::Rdma,
         files_dir: PathBuf::from("/tmp/model"),
         out_dir: PathBuf::from("/tmp/model-out"),
         data_dir: PathBuf::from("/tmp/df-rdma-efa"),
@@ -136,6 +142,7 @@ fn parse_args() -> Args {
             "--concurrency" => args.concurrency = it.next().unwrap().parse().unwrap(),
             "--digest" => args.digest = DigestAlgorithm::parse(&it.next().expect("--digest")),
             "--sink" => args.sink = Sink::parse(&it.next().expect("--sink")),
+            "--transport" => args.transport = Transport::parse(&it.next().expect("--transport")),
             "--files-dir" => args.files_dir = PathBuf::from(it.next().expect("--files-dir")),
             "--out-dir" => args.out_dir = PathBuf::from(it.next().expect("--out-dir")),
             "--data-dir" => args.data_dir = PathBuf::from(it.next().expect("--data-dir")),
@@ -149,8 +156,8 @@ fn provider_from_arg(name: &str) -> RdmaProvider {
     match name {
         "efa" => RdmaProvider::Efa,
         "verbs" => RdmaProvider::Verbs,
-        "auto" => RdmaProvider::Auto,
-        other => panic!("unsupported --provider {other} (expected efa|verbs|auto)"),
+        "auto" | "software" => RdmaProvider::Auto,
+        other => panic!("unsupported --provider {other} (expected efa|verbs|auto|software)"),
     }
 }
 
@@ -158,7 +165,9 @@ fn make_config(args: &Args) -> Config {
     let mut config = Config::default();
     config.storage.server.rdma.enable = true;
     config.storage.server.rdma.provider = provider_from_arg(&args.provider);
-    config.storage.server.rdma.allow_software_provider = false;
+    // The software providers are far slower than a NIC and must never be measured by accident,
+    // so they are opt-in and only useful for checking that the harness itself works.
+    config.storage.server.rdma.allow_software_provider = args.provider == "software";
     config.storage.server.rdma.device = args.device.clone();
     config.storage.server.rdma.fabric_tag = Some(args.fabric_tag.clone());
     config.storage.server.rdma.chunk_size = ByteSize::mib(args.chunk_mib);
@@ -392,37 +401,56 @@ async fn run_server(args: Args) {
 async fn run_client(args: Args) {
     std::fs::create_dir_all(&args.out_dir).unwrap();
     let config = Arc::new(make_config(&args));
-    let provider_hint = match args.provider.as_str() {
-        "efa" => Some("efa"),
-        "verbs" => Some("verbs"),
-        "auto" => None,
-        other => panic!("unsupported provider {other}"),
-    };
-    let fabric = Arc::new(
-        Fabric::new(
-            provider_hint,
-            args.device.as_deref(),
-            64 * 1024 * 1024 * 1024,
-            false,
-        )
-        .unwrap_or_else(|e| panic!("open {} fabric: {e}", args.provider)),
-    );
-    let capability = WireCapability {
-        provider: fabric.provider().to_string(),
-        fabric_tag: args.fabric_tag.clone(),
-    };
     let tcp_addr = format!("{}:{}", args.parent_host, args.tcp_port);
     let rdma_addr = format!("{}:{}", args.parent_host, args.rdma_port);
-    let advertisement = discover(&tcp_addr, Duration::from_secs(30))
-        .await
-        .expect("discover");
-    capability
-        .compatible(&advertisement.capability)
-        .expect("compatible");
-    println!(
-        "discovered provider={} fabric_tag={} rdma_port={}",
-        advertisement.capability.provider, advertisement.capability.fabric_tag, advertisement.port
-    );
+
+    // The TCP piece server is the transport RDMA falls back to, so it is measured through the
+    // same manifest, digest, sink, and concurrency machinery. Only the fabric is skipped.
+    let mut client_fabric = None;
+    let rdma_client = match args.transport {
+        Transport::Tcp => None,
+        Transport::Rdma => {
+            let provider_hint = match args.provider.as_str() {
+                "efa" => Some("efa"),
+                "verbs" => Some("verbs"),
+                "auto" | "software" => None,
+                other => panic!("unsupported provider {other}"),
+            };
+            let fabric = Arc::new(
+                Fabric::new(
+                    provider_hint,
+                    args.device.as_deref(),
+                    64 * 1024 * 1024 * 1024,
+                    args.provider == "software",
+                )
+                .unwrap_or_else(|e| panic!("open {} fabric: {e}", args.provider)),
+            );
+            let capability = WireCapability {
+                provider: fabric.provider().to_string(),
+                fabric_tag: args.fabric_tag.clone(),
+            };
+            let advertisement = discover(&tcp_addr, Duration::from_secs(30))
+                .await
+                .expect("discover");
+            capability
+                .compatible(&advertisement.capability)
+                .expect("compatible");
+            println!(
+                "discovered provider={} fabric_tag={} rdma_port={}",
+                advertisement.capability.provider,
+                advertisement.capability.fabric_tag,
+                advertisement.port
+            );
+            client_fabric = Some(fabric.clone());
+            Some(RDMAClient::new(
+                config.clone(),
+                fabric,
+                capability,
+                rdma_addr,
+            ))
+        }
+    };
+    let tcp_client = TCPClient::new(config.clone(), tcp_addr.clone());
 
     let task_id = std::env::var("MODEL_TASK_ID").expect("MODEL_TASK_ID");
     let manifest_piece: u32 = std::env::var("MODEL_MANIFEST_PIECE")
@@ -430,14 +458,24 @@ async fn run_client(args: Args) {
         .parse()
         .unwrap();
 
-    let client = RDMAClient::new(config, fabric.clone(), capability, rdma_addr);
-    let (mut reader, _, _) = client
-        .download_piece(manifest_piece, &task_id)
-        .await
-        .expect("download manifest");
     let mut manifest_buf = Vec::new();
-    reader.read_to_end(&mut manifest_buf).await.unwrap();
-    drop(reader);
+    match rdma_client.as_ref() {
+        Some(client) => {
+            let (mut reader, _, _) = client
+                .download_piece(manifest_piece, &task_id)
+                .await
+                .expect("download manifest");
+            reader.read_to_end(&mut manifest_buf).await.unwrap();
+        }
+        None => {
+            let (reader, _, _) = tcp_client
+                .download_piece(manifest_piece, &task_id)
+                .await
+                .expect("download manifest");
+            tokio::pin!(reader);
+            reader.read_to_end(&mut manifest_buf).await.unwrap();
+        }
+    }
     let manifest = Manifest::decode(&manifest_buf);
     let total_bytes: u64 = manifest.entries.iter().map(|e| e.size).sum();
     println!(
@@ -446,12 +484,18 @@ async fn run_client(args: Args) {
         total_bytes
     );
 
+    // RDMA lands a whole window in registered memory before the consumer sees it, so the TCP path
+    // is batched at the same granularity. Otherwise the two transports would be handing the digest
+    // and the sink different sized blocks and the comparison would measure batching, not transport.
+    let window_bytes = (args.chunk_mib * 1024 * 1024) as usize * args.max_inflight as usize;
+
     let t0 = Instant::now();
     let sem = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
     let mut joins = Vec::new();
     for entry in manifest.entries.clone() {
         let permit = sem.clone().acquire_owned().await.unwrap();
-        let client = client.clone();
+        let rdma_client = rdma_client.clone();
+        let tcp_client = tcp_client.clone();
         let out_dir = args.out_dir.clone();
         let task_id = task_id.clone();
         let digest_algorithm = args.digest;
@@ -459,10 +503,22 @@ async fn run_client(args: Args) {
         joins.push(tokio::spawn(async move {
             let _permit = permit;
             let start = Instant::now();
-            let (mut reader, _, _) = client
-                .download_piece(entry.piece, &task_id)
-                .await
-                .unwrap_or_else(|e| panic!("download piece {}: {e}", entry.piece));
+            let mut reader = match rdma_client.as_ref() {
+                Some(client) => PieceReader::Rdma(
+                    client
+                        .download_piece(entry.piece, &task_id)
+                        .await
+                        .unwrap_or_else(|e| panic!("download piece {}: {e}", entry.piece))
+                        .0,
+                ),
+                None => PieceReader::Tcp(Box::pin(
+                    tcp_client
+                        .download_piece(entry.piece, &task_id)
+                        .await
+                        .unwrap_or_else(|e| panic!("download piece {}: {e}", entry.piece))
+                        .0,
+                )),
+            };
 
             let path = out_dir.join(&entry.relative_path);
             if sink != Sink::Null {
@@ -484,37 +540,39 @@ async fn run_client(args: Args) {
             let mut cost = Cost::default();
             let mut hasher = Hasher::new(digest_algorithm);
             let mut written = 0u64;
+            let mut spare = None;
             loop {
                 let wait = Instant::now();
-                let Some(window) = reader.next_window().await.unwrap() else {
+                let Some(block) = reader.next_block(window_bytes, spare.take()).await.unwrap()
+                else {
                     cost.fabric += wait.elapsed();
                     break;
                 };
                 cost.fabric += wait.elapsed();
 
                 if let Some(file) = pwrite_file.clone() {
-                    // Both stages only read the registered window, so they run on separate blocking
-                    // threads and each window reaches the file in one pwrite. tokio::fs::File would
-                    // instead copy the window into a buffer of its own first.
+                    // Both stages only read the block, so they run on separate blocking threads and
+                    // each block reaches the file in one pwrite. tokio::fs::File would instead copy
+                    // the block into a buffer of its own first.
                     let position = written;
-                    written += window.bytes().len() as u64;
-                    let window = Arc::new(window);
+                    written += block.bytes().len() as u64;
+                    let block = Arc::new(block);
 
                     let digest = {
-                        let window = window.clone();
+                        let block = block.clone();
                         tokio::task::spawn_blocking(move || {
                             let mut hasher = hasher;
                             let hash = Instant::now();
-                            hasher.update(window.bytes());
+                            hasher.update(block.bytes());
                             (hasher, hash.elapsed())
                         })
                     };
 
                     let write = {
-                        let window = window.clone();
+                        let block = block.clone();
                         tokio::task::spawn_blocking(move || {
                             let start = Instant::now();
-                            file.write_all_at(window.bytes(), position).unwrap();
+                            file.write_all_at(block.bytes(), position).unwrap();
                             start.elapsed()
                         })
                     };
@@ -524,10 +582,11 @@ async fn run_client(args: Args) {
                     hasher = returned_hasher;
                     cost.digest += digest_cost;
                     cost.write += write.unwrap();
+                    spare = Arc::try_unwrap(block).ok().and_then(Block::into_spare);
                     continue;
                 }
 
-                let bytes = window.bytes();
+                let bytes = block.bytes();
                 written += bytes.len() as u64;
 
                 let hash = Instant::now();
@@ -539,6 +598,7 @@ async fn run_client(args: Args) {
                     file.write_all(bytes).await.unwrap();
                     cost.write += write.elapsed();
                 }
+                spare = block.into_spare();
             }
             if let Some(mut file) = tokio_file {
                 let write = Instant::now();
@@ -577,7 +637,8 @@ async fn run_client(args: Args) {
 
     let elapsed = t0.elapsed();
     println!(
-        "MODEL_TRANSFER_DONE files={} bytes={} elapsed={:?} aggregate_goodput={:.2} Gbps digest={} sink={} concurrency={} chunk_mib={} inflight={} fabric_failed={}",
+        "MODEL_TRANSFER_DONE transport={} files={} bytes={} elapsed={:?} aggregate_goodput={:.2} Gbps digest={} sink={} concurrency={} chunk_mib={} inflight={} fabric_failed={}",
+        args.transport.name(),
         manifest.entries.len(),
         total_bytes,
         elapsed,
@@ -587,7 +648,7 @@ async fn run_client(args: Args) {
         args.concurrency,
         args.chunk_mib,
         args.max_inflight,
-        fabric.is_failed(),
+        client_fabric.map(|fabric| fabric.is_failed()).unwrap_or(false),
     );
     println!("MODEL_TRANSFER_COST {}", total.report(total_bytes));
 }
@@ -690,6 +751,93 @@ impl Hasher {
                 None
             }
             Self::None => None,
+        }
+    }
+}
+
+/// PieceReader is one in-flight piece download, over whichever transport the run selected. It
+/// exists so the measurement loop below is written once: anything it reports as a difference
+/// between the two transports comes from the transport rather than from two hand-written loops
+/// that drifted apart.
+enum PieceReader {
+    Rdma(RDMAStreamReader),
+    Tcp(Pin<Box<dyn AsyncRead + Send>>),
+}
+
+impl PieceReader {
+    /// next_block returns the next block of the piece, or None at end of stream. RDMA hands back
+    /// the registered window the NIC wrote into. TCP fills `spare` (a buffer recycled across
+    /// blocks, so the socket path is not charged for an allocation per window) up to the same
+    /// window size, short only at end of stream.
+    async fn next_block(
+        &mut self,
+        window_bytes: usize,
+        spare: Option<Vec<u8>>,
+    ) -> io::Result<Option<Block>> {
+        match self {
+            Self::Rdma(reader) => Ok(reader.next_window().await?.map(Block::Window)),
+            Self::Tcp(reader) => {
+                let mut buf = spare.unwrap_or_else(|| Vec::with_capacity(window_bytes));
+                buf.clear();
+                while buf.len() < window_bytes {
+                    if reader.read_buf(&mut buf).await? == 0 {
+                        break;
+                    }
+                }
+
+                Ok((!buf.is_empty()).then_some(Block::Owned(buf)))
+            }
+        }
+    }
+}
+
+/// Block is one unit of received data handed to the digest and the sink.
+enum Block {
+    Window(ReceivedWindow),
+    Owned(Vec<u8>),
+}
+
+impl Block {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Window(window) => window.bytes(),
+            Self::Owned(buf) => buf.as_slice(),
+        }
+    }
+
+    /// into_spare reclaims a TCP block's allocation for the next read. RDMA windows return to the
+    /// registered pool on drop instead, which is what lets the fabric reuse them.
+    fn into_spare(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Window(_) => None,
+            Self::Owned(buf) => Some(buf),
+        }
+    }
+}
+
+/// Transport selects which parent-side piece server the client downloads from. `rdma` uses the
+/// libfabric data plane, `tcp` uses the Vortex piece server that RDMA falls back to. Both are
+/// driven through the same digest and sink stages so the difference between them is the transport
+/// and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Rdma,
+    Tcp,
+}
+
+impl Transport {
+    fn parse(name: &str) -> Self {
+        match name {
+            "rdma" => Self::Rdma,
+            "tcp" => Self::Tcp,
+            other => panic!("unsupported --transport {other} (expected rdma|tcp)"),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Rdma => "rdma",
+            Self::Tcp => "tcp",
         }
     }
 }
