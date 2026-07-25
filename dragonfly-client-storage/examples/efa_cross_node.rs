@@ -19,6 +19,7 @@ use leaky_bucket::RateLimiter;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -87,11 +88,14 @@ struct Args {
     parent_host: String,
     tcp_port: u16,
     rdma_port: u16,
+    provider: String,
     device: Option<String>,
     fabric_tag: String,
     chunk_mib: u64,
     max_inflight: u32,
     concurrency: usize,
+    digest: DigestAlgorithm,
+    sink: Sink,
     files_dir: PathBuf,
     out_dir: PathBuf,
     data_dir: PathBuf,
@@ -104,11 +108,14 @@ fn parse_args() -> Args {
         parent_host: "127.0.0.1".into(),
         tcp_port: 4001,
         rdma_port: 4007,
+        provider: "verbs".into(),
         device: None,
-        fabric_tag: "efa-test".into(),
+        fabric_tag: "roce-test".into(),
         chunk_mib: 4,
         max_inflight: 16,
         concurrency: 2,
+        digest: DigestAlgorithm::Sha256,
+        sink: Sink::Pwrite,
         files_dir: PathBuf::from("/tmp/model"),
         out_dir: PathBuf::from("/tmp/model-out"),
         data_dir: PathBuf::from("/tmp/df-rdma-efa"),
@@ -121,11 +128,14 @@ fn parse_args() -> Args {
             "--parent-host" => args.parent_host = it.next().expect("--parent-host"),
             "--tcp-port" => args.tcp_port = it.next().unwrap().parse().unwrap(),
             "--rdma-port" => args.rdma_port = it.next().unwrap().parse().unwrap(),
+            "--provider" => args.provider = it.next().expect("--provider"),
             "--device" => args.device = Some(it.next().expect("--device")),
             "--fabric-tag" => args.fabric_tag = it.next().expect("--fabric-tag"),
             "--chunk-mib" => args.chunk_mib = it.next().unwrap().parse().unwrap(),
             "--max-inflight" => args.max_inflight = it.next().unwrap().parse().unwrap(),
             "--concurrency" => args.concurrency = it.next().unwrap().parse().unwrap(),
+            "--digest" => args.digest = DigestAlgorithm::parse(&it.next().expect("--digest")),
+            "--sink" => args.sink = Sink::parse(&it.next().expect("--sink")),
             "--files-dir" => args.files_dir = PathBuf::from(it.next().expect("--files-dir")),
             "--out-dir" => args.out_dir = PathBuf::from(it.next().expect("--out-dir")),
             "--data-dir" => args.data_dir = PathBuf::from(it.next().expect("--data-dir")),
@@ -135,10 +145,19 @@ fn parse_args() -> Args {
     args
 }
 
+fn provider_from_arg(name: &str) -> RdmaProvider {
+    match name {
+        "efa" => RdmaProvider::Efa,
+        "verbs" => RdmaProvider::Verbs,
+        "auto" => RdmaProvider::Auto,
+        other => panic!("unsupported --provider {other} (expected efa|verbs|auto)"),
+    }
+}
+
 fn make_config(args: &Args) -> Config {
     let mut config = Config::default();
     config.storage.server.rdma.enable = true;
-    config.storage.server.rdma.provider = RdmaProvider::Efa;
+    config.storage.server.rdma.provider = provider_from_arg(&args.provider);
     config.storage.server.rdma.allow_software_provider = false;
     config.storage.server.rdma.device = args.device.clone();
     config.storage.server.rdma.fabric_tag = Some(args.fabric_tag.clone());
@@ -303,11 +322,20 @@ async fn run_server(args: Args) {
         "efa-model-server".into(),
         false,
     ));
+    // Build the upload limiter exactly like dfdaemon does. Hard-coding a smaller bucket here caps
+    // the fabric long before any copy or digest does, which silently turns this into a benchmark of
+    // the leaky bucket rather than of RDMA.
+    let upload_bandwidth_limit = config.upload.bandwidth_limit.as_u64() as usize;
+    println!(
+        "upload bandwidth limit {} ({:.1} Gbps)",
+        config.upload.bandwidth_limit,
+        (upload_bandwidth_limit as f64) * 8.0 / 1e9
+    );
     let limiter = Arc::new(
         RateLimiter::builder()
-            .initial(1024 * 1024 * 1024)
-            .refill(1024 * 1024 * 1024)
-            .max(1024 * 1024 * 1024)
+            .initial(upload_bandwidth_limit)
+            .refill(upload_bandwidth_limit)
+            .max(upload_bandwidth_limit)
             .interval(Duration::from_secs(1))
             .fair(false)
             .build(),
@@ -364,14 +392,20 @@ async fn run_server(args: Args) {
 async fn run_client(args: Args) {
     std::fs::create_dir_all(&args.out_dir).unwrap();
     let config = Arc::new(make_config(&args));
+    let provider_hint = match args.provider.as_str() {
+        "efa" => Some("efa"),
+        "verbs" => Some("verbs"),
+        "auto" => None,
+        other => panic!("unsupported provider {other}"),
+    };
     let fabric = Arc::new(
         Fabric::new(
-            Some("efa"),
+            provider_hint,
             args.device.as_deref(),
             64 * 1024 * 1024 * 1024,
             false,
         )
-        .expect("open efa fabric"),
+        .unwrap_or_else(|e| panic!("open {} fabric: {e}", args.provider)),
     );
     let capability = WireCapability {
         provider: fabric.provider().to_string(),
@@ -420,6 +454,8 @@ async fn run_client(args: Args) {
         let client = client.clone();
         let out_dir = args.out_dir.clone();
         let task_id = task_id.clone();
+        let digest_algorithm = args.digest;
+        let sink = args.sink;
         joins.push(tokio::spawn(async move {
             let _permit = permit;
             let start = Instant::now();
@@ -427,53 +463,264 @@ async fn run_client(args: Args) {
                 .download_piece(entry.piece, &task_id)
                 .await
                 .unwrap_or_else(|e| panic!("download piece {}: {e}", entry.piece));
+
             let path = out_dir.join(&entry.relative_path);
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.unwrap();
-            }
-            let mut f = tokio::fs::File::create(&path).await.unwrap();
-            let mut hasher = Sha256::new();
-            let mut written = 0u64;
-            let mut buf = vec![0u8; 16 * 1024 * 1024];
-            loop {
-                let n = reader.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
+            if sink != Sink::Null {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await.unwrap();
                 }
-                hasher.update(&buf[..n]);
-                f.write_all(&buf[..n]).await.unwrap();
-                written += n as u64;
             }
-            f.flush().await.unwrap();
-            drop(f);
+            let mut tokio_file = match sink {
+                Sink::Tokio => Some(tokio::fs::File::create(&path).await.unwrap()),
+                _ => None,
+            };
+            let pwrite_file = match sink {
+                Sink::Pwrite => Some(Arc::new(std::fs::File::create(&path).unwrap())),
+                _ => None,
+            };
+
+            // Attribute the wall clock to the three stages that touch every byte, so a slow run
+            // can be blamed on the fabric, the digest, or the filesystem rather than guessed at.
+            let mut cost = Cost::default();
+            let mut hasher = Hasher::new(digest_algorithm);
+            let mut written = 0u64;
+            loop {
+                let wait = Instant::now();
+                let Some(window) = reader.next_window().await.unwrap() else {
+                    cost.fabric += wait.elapsed();
+                    break;
+                };
+                cost.fabric += wait.elapsed();
+
+                if let Some(file) = pwrite_file.clone() {
+                    // Both stages only read the registered window, so they run on separate blocking
+                    // threads and each window reaches the file in one pwrite. tokio::fs::File would
+                    // instead copy the window into a buffer of its own first.
+                    let position = written;
+                    written += window.bytes().len() as u64;
+                    let window = Arc::new(window);
+
+                    let digest = {
+                        let window = window.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut hasher = hasher;
+                            let hash = Instant::now();
+                            hasher.update(window.bytes());
+                            (hasher, hash.elapsed())
+                        })
+                    };
+
+                    let write = {
+                        let window = window.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let start = Instant::now();
+                            file.write_all_at(window.bytes(), position).unwrap();
+                            start.elapsed()
+                        })
+                    };
+
+                    let (digest, write) = tokio::join!(digest, write);
+                    let (returned_hasher, digest_cost) = digest.unwrap();
+                    hasher = returned_hasher;
+                    cost.digest += digest_cost;
+                    cost.write += write.unwrap();
+                    continue;
+                }
+
+                let bytes = window.bytes();
+                written += bytes.len() as u64;
+
+                let hash = Instant::now();
+                hasher.update(bytes);
+                cost.digest += hash.elapsed();
+
+                if let Some(file) = tokio_file.as_mut() {
+                    let write = Instant::now();
+                    file.write_all(bytes).await.unwrap();
+                    cost.write += write.elapsed();
+                }
+            }
+            if let Some(mut file) = tokio_file {
+                let write = Instant::now();
+                file.flush().await.unwrap();
+                cost.write += write.elapsed();
+            }
             drop(reader);
+
             assert_eq!(written, entry.size, "{}", entry.relative_path);
-            let got = Digest::new(Algorithm::Sha256, hex::encode(hasher.finalize())).to_string();
-            assert_eq!(got, entry.digest, "digest mismatch {}", entry.relative_path);
-            let gbps = (entry.size as f64) * 8.0 / start.elapsed().as_secs_f64() / 1e9;
+            if let Some(digest) = hasher.finalize() {
+                assert_eq!(
+                    digest, entry.digest,
+                    "digest mismatch {}",
+                    entry.relative_path
+                );
+            }
+
+            let elapsed = start.elapsed();
             println!(
-                "OK piece={} path={} size={} elapsed={:?} goodput={:.2} Gbps",
+                "OK piece={} path={} size={} elapsed={:?} goodput={:.2} Gbps {}",
                 entry.piece,
                 entry.relative_path,
                 entry.size,
-                start.elapsed(),
-                gbps
+                elapsed,
+                goodput_gbps(entry.size, elapsed),
+                cost.report(entry.size),
             );
+            cost
         }));
     }
-    for j in joins {
-        j.await.unwrap();
+
+    let mut total = Cost::default();
+    for join in joins {
+        total += join.await.unwrap();
     }
+
     let elapsed = t0.elapsed();
-    let gbps = (total_bytes as f64) * 8.0 / elapsed.as_secs_f64() / 1e9;
     println!(
-        "MODEL_TRANSFER_DONE files={} bytes={} elapsed={:?} aggregate_goodput={:.2} Gbps fabric_failed={}",
+        "MODEL_TRANSFER_DONE files={} bytes={} elapsed={:?} aggregate_goodput={:.2} Gbps digest={} sink={} concurrency={} chunk_mib={} inflight={} fabric_failed={}",
         manifest.entries.len(),
         total_bytes,
         elapsed,
-        gbps,
-        fabric.is_failed()
+        goodput_gbps(total_bytes, elapsed),
+        args.digest.name(),
+        args.sink.name(),
+        args.concurrency,
+        args.chunk_mib,
+        args.max_inflight,
+        fabric.is_failed(),
     );
+    println!("MODEL_TRANSFER_COST {}", total.report(total_bytes));
+}
+
+fn goodput_gbps(bytes: u64, elapsed: Duration) -> f64 {
+    (bytes as f64) * 8.0 / elapsed.as_secs_f64() / 1e9
+}
+
+/// Cost splits the per-byte work into the stages that can each cap end-to-end goodput. The stages
+/// are summed across concurrent transfers, so with concurrency > 1 they overlap and add up to more
+/// than the wall clock.
+#[derive(Debug, Default, Clone, Copy)]
+struct Cost {
+    fabric: Duration,
+    digest: Duration,
+    write: Duration,
+}
+
+impl Cost {
+    fn report(&self, bytes: u64) -> String {
+        format!(
+            "cost[fabric={:?} ({:.1} Gbps) digest={:?} ({:.1} Gbps) write={:?} ({:.1} Gbps)]",
+            self.fabric,
+            goodput_gbps(bytes, self.fabric),
+            self.digest,
+            goodput_gbps(bytes, self.digest),
+            self.write,
+            goodput_gbps(bytes, self.write),
+        )
+    }
+}
+
+impl std::ops::AddAssign for Cost {
+    fn add_assign(&mut self, other: Self) {
+        self.fabric += other.fabric;
+        self.digest += other.digest;
+        self.write += other.write;
+    }
+}
+
+/// DigestAlgorithm selects the receive-side integrity check. `sha256` verifies against the manifest,
+/// `crc32` matches what dfdaemon actually computes per piece, and `none` isolates the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestAlgorithm {
+    Sha256,
+    Crc32,
+    None,
+}
+
+impl DigestAlgorithm {
+    fn parse(name: &str) -> Self {
+        match name {
+            "sha256" => Self::Sha256,
+            "crc32" => Self::Crc32,
+            "none" => Self::None,
+            other => panic!("unsupported --digest {other} (expected sha256|crc32|none)"),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Crc32 => "crc32",
+            Self::None => "none",
+        }
+    }
+}
+
+enum Hasher {
+    Sha256(Sha256),
+    Crc32(crc32fast::Hasher),
+    None,
+}
+
+impl Hasher {
+    fn new(algorithm: DigestAlgorithm) -> Self {
+        match algorithm {
+            DigestAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            DigestAlgorithm::Crc32 => Self::Crc32(crc32fast::Hasher::new()),
+            DigestAlgorithm::None => Self::None,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha256(hasher) => hasher.update(bytes),
+            Self::Crc32(hasher) => hasher.update(bytes),
+            Self::None => {}
+        }
+    }
+
+    /// finalize returns a manifest-comparable digest, which only sha256 can produce.
+    fn finalize(self) -> Option<String> {
+        match self {
+            Self::Sha256(hasher) => {
+                Some(Digest::new(Algorithm::Sha256, hex::encode(hasher.finalize())).to_string())
+            }
+            Self::Crc32(hasher) => {
+                std::hint::black_box(hasher.finalize());
+                None
+            }
+            Self::None => None,
+        }
+    }
+}
+
+/// Sink selects where received bytes land. `tokio` writes through tokio::fs, `pwrite` writes each
+/// window with one pwrite straight out of registered memory, and `null` drops them to measure the
+/// fabric and digest without the filesystem in the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    Tokio,
+    Pwrite,
+    Null,
+}
+
+impl Sink {
+    fn parse(name: &str) -> Self {
+        match name {
+            "tokio" => Self::Tokio,
+            "pwrite" => Self::Pwrite,
+            "null" => Self::Null,
+            other => panic!("unsupported --sink {other} (expected tokio|pwrite|null)"),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Tokio => "tokio",
+            Self::Pwrite => "pwrite",
+            Self::Null => "null",
+        }
+    }
 }
 
 #[tokio::main]

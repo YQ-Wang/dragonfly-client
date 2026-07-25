@@ -640,17 +640,9 @@ pub mod rdma {
             _host_id: &str,
             task_id: &str,
         ) -> Result<(Box<dyn AsyncRead + Send + Unpin>, u64, String)> {
-            let client = self.client(addr).await?;
-            match client.download_piece(number, task_id).await {
-                Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
-                Err(err) => {
-                    if client.fabric_failed() {
-                        self.retire_failed_fabric().await;
-                    }
-                    self.record_incompatible(addr, &err);
-                    Err(err)
-                }
-            }
+            let (reader, offset, digest) =
+                self.download_piece_stream(addr, number, task_id).await?;
+            Ok((Box::new(reader), offset, digest))
         }
 
         /// download_persistent_piece downloads a persistent piece from the other peer over
@@ -692,6 +684,34 @@ pub mod rdma {
                 .await
             {
                 Ok((reader, offset, digest)) => Ok((Box::new(reader), offset, digest)),
+                Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
+                    self.record_incompatible(addr, &err);
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    impl RDMADownloader {
+        /// download_piece_stream returns the concrete RDMA reader so callers can write registered
+        /// windows without an AsyncRead bounce buffer.
+        #[instrument(skip_all)]
+        pub async fn download_piece_stream(
+            &self,
+            addr: &str,
+            number: u32,
+            task_id: &str,
+        ) -> Result<(
+            dragonfly_client_storage::client::rdma::RDMAStreamReader,
+            u64,
+            String,
+        )> {
+            let client = self.client(addr).await?;
+            match client.download_piece(number, task_id).await {
+                Ok(downloaded) => Ok(downloaded),
                 Err(err) => {
                     if client.fabric_failed() {
                         self.retire_failed_fabric().await;

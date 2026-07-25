@@ -16,6 +16,10 @@
 
 use super::*;
 use chrono::Utc;
+// The concrete RDMADownloader needs the trait in scope for its persistent-piece methods; trait
+// objects such as tcp_downloader resolve them without it.
+#[cfg(feature = "rdma")]
+use crate::resource::piece_downloader::Downloader;
 use dragonfly_api::common::v2::{Hdfs, HuggingFace, ModelScope, ObjectStorage, Range, TrafficType};
 use dragonfly_client_backend::{BackendFactory, GetRequest};
 use dragonfly_client_config::dfdaemon::Config;
@@ -74,7 +78,8 @@ pub struct Piece {
     /// rdma_downloader is the libfabric piece downloader (AWS EFA, RoCE/InfiniBand). It is
     /// only Some when the client is built with the `rdma` feature and the download protocol
     /// is "rdma"; every RDMA failure falls back to the TCP downloader for that piece.
-    rdma_downloader: Option<Arc<dyn piece_downloader::Downloader>>,
+    #[cfg(feature = "rdma")]
+    rdma_downloader: Option<Arc<piece_downloader::rdma::RDMADownloader>>,
 
     /// backend_factory is the backend factory.
     backend_factory: Arc<BackendFactory>,
@@ -102,17 +107,16 @@ impl Piece {
     ) -> Result<Self> {
         #[cfg(feature = "rdma")]
         let rdma_downloader = if config.download.protocol == "rdma" {
-            Some(piece_downloader::DownloaderFactory::new("rdma", config.clone())?.build())
+            Some(Arc::new(piece_downloader::rdma::RDMADownloader::new(
+                config.clone(),
+            )))
         } else {
             None
         };
         #[cfg(not(feature = "rdma"))]
-        let rdma_downloader = {
-            if config.download.protocol == "rdma" {
-                warn!("download protocol is rdma but this build lacks the rdma feature, using tcp");
-            }
-            None
-        };
+        if config.download.protocol == "rdma" {
+            warn!("download protocol is rdma but this build lacks the rdma feature, using tcp");
+        }
 
         Ok(Self {
             config: config.clone(),
@@ -120,6 +124,7 @@ impl Piece {
             tcp_downloader: piece_downloader::DownloaderFactory::new("tcp", config.clone())?
                 .build(),
             quic_downloader: piece_downloader::DownloaderFactory::new("quic", config)?.build(),
+            #[cfg(feature = "rdma")]
             rdma_downloader,
             backend_factory,
             download_bandwidth_limiter,
@@ -403,17 +408,38 @@ impl Piece {
             .acquire(length as usize)
             .await;
 
-        let rdma_tcp_addr = if self.config.download.protocol == "rdma" {
-            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
-                (Some(ip), Some(port)) => {
-                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+        // RDMA lands each receive window in content storage straight out of registered memory, so
+        // it never produces an AsyncRead for the shared finish path below.
+        #[cfg(feature = "rdma")]
+        if let ("rdma", Some(ip), Some(port)) = (
+            self.config.download.protocol.as_str(),
+            parent.download_ip.as_deref(),
+            parent.download_tcp_port,
+        ) {
+            let tcp_addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+            match self
+                .download_piece_from_parent_over_rdma(
+                    piece_id,
+                    task_id,
+                    number,
+                    length,
+                    parent.id.as_str(),
+                    &tcp_addr,
+                )
+                .await
+            {
+                Ok(piece) => {
+                    collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+
+                    scopeguard::ScopeGuard::into_inner(guard);
+                    return Ok(piece);
                 }
-                _ => None,
+                // RDMA is an optimization: any rendezvous, fabric, or write error re-downloads the
+                // piece from the parent's TCP piece server below.
+                Err(err) => warn!("rdma download failed, fall back to tcp downloader: {}", err),
             }
-        } else {
-            None
-        };
-        let mut streamed_rdma = false;
+        }
+
         let (mut reader, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -439,39 +465,6 @@ impl Piece {
                         task_id,
                     )
                     .await?
-            }
-            ("rdma", Some(ip), Some(download_tcp_port), _) if self.rdma_downloader.is_some() => {
-                let ip = IpAddr::from_str(&ip)?;
-                let rdma_downloader = self.rdma_downloader.as_ref().unwrap();
-                match rdma_downloader
-                    .download_piece(
-                        // RDMA discovery is multiplexed on the parent's advertised TCP piece
-                        // endpoint and returns its actual rendezvous port.
-                        &format_socket_addr(ip, download_tcp_port as u16),
-                        number,
-                        host_id,
-                        task_id,
-                    )
-                    .await
-                {
-                    Ok(downloaded) => {
-                        streamed_rdma = true;
-                        downloaded
-                    }
-                    // RDMA is an optimization: any rendezvous or fabric error falls back to
-                    // the parent's TCP piece server for this piece.
-                    Err(err) => {
-                        warn!("rdma download failed, fall back to tcp downloader: {}", err);
-                        self.tcp_downloader
-                            .download_piece(
-                                &format_socket_addr(ip, download_tcp_port as u16),
-                                number,
-                                host_id,
-                                task_id,
-                            )
-                            .await?
-                    }
-                }
             }
             ("rdma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
@@ -505,7 +498,7 @@ impl Piece {
         };
 
         // Record the finish of downloading piece.
-        match self
+        let piece = self
             .storage
             .download_piece_from_parent_finished(
                 piece_id,
@@ -518,46 +511,63 @@ impl Piece {
                 self.config.storage.write_piece_timeout,
             )
             .await
-        {
-            Ok(piece) => {
-                collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+            .inspect_err(|err| {
+                error!("download piece finished: {}", err);
+            })?;
 
-                scopeguard::ScopeGuard::into_inner(guard);
-                Ok(piece)
-            }
+        collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+
+        scopeguard::ScopeGuard::into_inner(guard);
+        Ok(piece)
+    }
+
+    /// download_piece_from_parent_over_rdma downloads one piece over the fabric, writing every
+    /// completed receive window into content storage straight out of registered memory.
+    ///
+    /// Discovery is multiplexed on the parent's advertised TCP piece endpoint, which returns the
+    /// actual rendezvous port. On a write failure the piece metadata is restarted so the caller can
+    /// re-download the piece over TCP.
+    #[cfg(feature = "rdma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    async fn download_piece_from_parent_over_rdma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        number: u32,
+        length: u64,
+        parent_id: &str,
+        tcp_addr: &str,
+    ) -> Result<metadata::Piece> {
+        let Some(rdma_downloader) = self.rdma_downloader.as_ref() else {
+            return Err(Error::Unknown("rdma downloader is disabled".to_string()));
+        };
+
+        let (mut reader, offset, digest) = rdma_downloader
+            .download_piece_stream(tcp_addr, number, task_id)
+            .await?;
+
+        match self
+            .storage
+            .download_piece_from_parent_finished_rdma(
+                piece_id,
+                task_id,
+                offset,
+                length,
+                digest.as_str(),
+                parent_id,
+                &mut reader,
+                self.config.storage.write_piece_timeout,
+            )
+            .await
+        {
+            Ok(piece) => Ok(piece),
             Err(err) => {
-                let Some(addr) = rdma_tcp_addr.filter(|_| streamed_rdma) else {
-                    error!("download piece finished: {}", err);
-                    return Err(err);
-                };
-                warn!(
-                    "streaming rdma piece failed while writing, restarting over tcp: {}",
-                    err
-                );
                 self.storage.download_piece_failed(piece_id)?;
                 self.storage
                     .download_piece_started(piece_id, number)
                     .await?;
-                let (mut reader, offset, digest) = self
-                    .tcp_downloader
-                    .download_piece(&addr, number, host_id, task_id)
-                    .await?;
-                let piece = self
-                    .storage
-                    .download_piece_from_parent_finished(
-                        piece_id,
-                        task_id,
-                        offset,
-                        length,
-                        digest.as_str(),
-                        parent.id.as_str(),
-                        &mut reader,
-                        self.config.storage.write_piece_timeout,
-                    )
-                    .await?;
-                collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
-                scopeguard::ScopeGuard::into_inner(guard);
-                Ok(piece)
+                Err(err)
             }
         }
     }
@@ -886,7 +896,11 @@ impl Piece {
         } else {
             None
         };
+        // Only an rdma build can stream a piece, so only it can need the TCP restart below.
+        #[cfg(feature = "rdma")]
         let mut streamed_rdma = false;
+        #[cfg(not(feature = "rdma"))]
+        let streamed_rdma = false;
         let (mut reader, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -915,6 +929,7 @@ impl Piece {
                     )
                     .await?
             }
+            #[cfg(feature = "rdma")]
             ("rdma", Some(ip), Some(download_tcp_port), _) if self.rdma_downloader.is_some() => {
                 let ip = IpAddr::from_str(&ip)?;
                 let rdma_downloader = self.rdma_downloader.as_ref().unwrap();
@@ -1312,7 +1327,11 @@ impl Piece {
         } else {
             None
         };
+        // Only an rdma build can stream a piece, so only it can need the TCP restart below.
+        #[cfg(feature = "rdma")]
         let mut streamed_rdma = false;
+        #[cfg(not(feature = "rdma"))]
+        let streamed_rdma = false;
         let (mut reader, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -1341,6 +1360,7 @@ impl Piece {
                     )
                     .await?
             }
+            #[cfg(feature = "rdma")]
             ("rdma", Some(ip), Some(download_tcp_port), _) if self.rdma_downloader.is_some() => {
                 let ip = IpAddr::from_str(&ip)?;
                 let rdma_downloader = self.rdma_downloader.as_ref().unwrap();

@@ -439,6 +439,95 @@ impl Content {
         })
     }
 
+    /// write_piece_from_rdma_stream writes completed RDMA receive windows straight from registered
+    /// memory into the task file, hashing each window in place. Unlike [`Self::write_piece`] there
+    /// is no AsyncRead bounce buffer between the fabric and the file.
+    #[cfg(feature = "rdma")]
+    #[instrument(skip_all)]
+    pub async fn write_piece_from_rdma_stream(
+        &self,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        reader: &mut crate::client::rdma::RDMAStreamReader,
+    ) -> Result<super::content::WritePieceResponse> {
+        use std::os::unix::fs::FileExt;
+
+        let task_path = self.get_task_path(task_id);
+
+        // A std::fs handle lets each window reach the file in a single pwrite straight out of
+        // registered memory, whereas tokio::fs::File would first copy the window into a buffer of
+        // its own. On a memory filesystem that copy costs about a third of the achievable goodput.
+        let opened_path = task_path.clone();
+        let file = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .truncate(false)
+                    .write(true)
+                    .open(opened_path)
+            })
+            .await
+            .map_err(|err| Error::Unknown(format!("open task file panicked: {}", err)))?
+            .inspect_err(|err| {
+                error!("open {:?} failed: {}", task_path, err);
+            })?,
+        );
+
+        let mut hasher = crc32fast::Hasher::new();
+        let mut length = 0u64;
+        while let Some(window) = reader.next_window().await? {
+            let window_length = window.bytes().len() as u64;
+
+            // Bound the write like write_piece's `take` does: a parent that streams more than the
+            // piece length must not overwrite the pieces that follow it in the task file.
+            if window_length > expected_length - length {
+                return Err(Error::Unknown(format!(
+                    "rdma stream exceeded expected length {}",
+                    expected_length
+                )));
+            }
+
+            // Digest and write both only read the window, so they run on separate blocking threads
+            // instead of in series, and the fabric receives the next window while they do.
+            let window = Arc::new(window);
+            let position = offset + length;
+            let digest = {
+                let window = window.clone();
+                tokio::task::spawn_blocking(move || {
+                    hasher.update(window.bytes());
+                    hasher
+                })
+            };
+            let write = {
+                let window = window.clone();
+                let file = file.clone();
+                tokio::task::spawn_blocking(move || file.write_all_at(window.bytes(), position))
+            };
+
+            let (digest, write) = tokio::join!(digest, write);
+            hasher = digest.map_err(|err| Error::Unknown(format!("digest panicked: {}", err)))?;
+            write
+                .map_err(|err| Error::Unknown(format!("write piece panicked: {}", err)))?
+                .inspect_err(|err| {
+                    error!("write {:?} failed: {}", task_path, err);
+                })?;
+
+            length += window_length;
+        }
+
+        if length != expected_length {
+            return Err(Error::Unknown(format!(
+                "expected length {} but got {}",
+                expected_length, length
+            )));
+        }
+
+        Ok(super::content::WritePieceResponse {
+            length,
+            hash: hasher.finalize().to_string(),
+        })
+    }
+
     /// get_task_path returns the task path by task id.
     fn get_task_path(&self, task_id: &str) -> PathBuf {
         // The task needs split by the first 3 characters of task id(sha256) to
@@ -1066,6 +1155,109 @@ mod tests {
             .unwrap();
         assert_eq!(response.length, 4);
         assert!(!response.hash.is_empty());
+    }
+
+    /// rdma_stream_reader hands the content layer windows that are already "received".
+    #[cfg(feature = "rdma")]
+    async fn rdma_stream_reader(payloads: &[&[u8]]) -> crate::client::rdma::RDMAStreamReader {
+        let fabric = crate::rdma::fabric::Fabric::new(None, None, 1024 * 1024, true)
+            .expect("libfabric endpoint");
+
+        let mut windows = Vec::new();
+        for payload in payloads {
+            let mut window = fabric.acquire_buffer(payload.len()).await.unwrap();
+            // Safety: this lease has not been posted.
+            unsafe { window.as_mut_slice() }.copy_from_slice(payload);
+            windows.push(window);
+        }
+
+        crate::client::rdma::RDMAStreamReader::from_windows(windows)
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_piece_from_rdma_stream() {
+        let temp_dir = tempdir().unwrap();
+        let config = Arc::new(Config::default());
+        let content = Content::new(config, temp_dir.path()).await.unwrap();
+
+        let task_id = "8ab7e2a2c1b7a5b19a4b3f7f2a9e6c1d3f5a7b9c1e3d5f7a9b1c3e5d7f9a1b3c";
+        content.create_task(task_id, 9).await.unwrap();
+
+        let mut reader = rdma_stream_reader(&[b"rdma", b"-win"]).await;
+        let response = content
+            .write_piece_from_rdma_stream(task_id, 1, 8, &mut reader)
+            .await
+            .unwrap();
+
+        assert_eq!(response.length, 8);
+        assert_eq!(
+            response.hash,
+            crc32fast::hash(b"rdma-win").to_string(),
+            "hash must cover the windows in order"
+        );
+
+        // The stream started at offset 1, so byte 0 must be untouched.
+        let written = tokio::fs::read(content.get_task_path(task_id))
+            .await
+            .unwrap();
+        assert_eq!(&written[1..9], b"rdma-win");
+    }
+
+    /// A parent that streams more than the piece length must be rejected before it can overwrite
+    /// the pieces that follow it in the task file.
+    #[cfg(feature = "rdma")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_piece_from_rdma_stream_rejects_overlong_stream() {
+        let temp_dir = tempdir().unwrap();
+        let config = Arc::new(Config::default());
+        let content = Content::new(config, temp_dir.path()).await.unwrap();
+
+        let task_id = "1cd7e2a2c1b7a5b19a4b3f7f2a9e6c1d3f5a7b9c1e3d5f7a9b1c3e5d7f9a1b3c";
+        content.create_task(task_id, 8).await.unwrap();
+
+        let mut reader = rdma_stream_reader(&[b"0123", b"4567"]).await;
+        let Err(err) = content
+            .write_piece_from_rdma_stream(task_id, 0, 6, &mut reader)
+            .await
+        else {
+            panic!("stream longer than the piece must fail");
+        };
+        assert!(
+            err.to_string().contains("exceeded expected length"),
+            "unexpected error: {}",
+            err
+        );
+
+        // Only the first window may have landed; the tail of the task file is still zeroed.
+        let written = tokio::fs::read(content.get_task_path(task_id))
+            .await
+            .unwrap();
+        assert_eq!(&written[4..], &[0u8; 4]);
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_piece_from_rdma_stream_rejects_short_stream() {
+        let temp_dir = tempdir().unwrap();
+        let config = Arc::new(Config::default());
+        let content = Content::new(config, temp_dir.path()).await.unwrap();
+
+        let task_id = "2ed7e2a2c1b7a5b19a4b3f7f2a9e6c1d3f5a7b9c1e3d5f7a9b1c3e5d7f9a1b3c";
+        content.create_task(task_id, 8).await.unwrap();
+
+        let mut reader = rdma_stream_reader(&[b"0123"]).await;
+        let Err(err) = content
+            .write_piece_from_rdma_stream(task_id, 0, 8, &mut reader)
+            .await
+        else {
+            panic!("stream shorter than the piece must fail");
+        };
+        assert!(
+            err.to_string().contains("expected length 8 but got 4"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[tokio::test]

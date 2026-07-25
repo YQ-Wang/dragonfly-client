@@ -304,12 +304,8 @@ impl Content {
         offset: u64,
         length: u64,
     ) -> Result<super::content::MappedPiece> {
-        self.map_path_range(
-            self.get_persistent_cache_task_path(task_id),
-            offset,
-            length,
-        )
-        .await
+        self.map_path_range(self.get_persistent_cache_task_path(task_id), offset, length)
+            .await
     }
 
     /// map_path_range memory-maps `[offset, offset+length)` of a content file.

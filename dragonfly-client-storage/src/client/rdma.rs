@@ -66,6 +66,66 @@ impl RDMAStreamReader {
             position: 0,
         }
     }
+
+    /// next_window returns the next completed receive window, or None at end of stream. Callers
+    /// hash and write straight out of registered memory, skipping the [`AsyncRead`] bounce buffer.
+    pub async fn next_window(&mut self) -> io::Result<Option<ReceivedWindow>> {
+        // A window already partially drained by poll_read yields only its remaining bytes, so the
+        // two APIs can be mixed without losing or re-delivering data.
+        if let Some(buf) = self.current.take() {
+            let consumed = std::mem::take(&mut self.position);
+            if consumed < buf.len() {
+                return Ok(Some(ReceivedWindow { buf, consumed }));
+            }
+        }
+
+        match self.receiver.recv().await {
+            Some(Ok(buf)) => Ok(Some(ReceivedWindow { buf, consumed: 0 })),
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
+        }
+    }
+}
+
+/// ReceivedWindow is one completed receive window still resident in the registered ring. Dropping
+/// it returns the registration to the buffer pool, so the fabric cannot receive the window after
+/// next until the consumer is done with this one.
+pub struct ReceivedWindow {
+    buf: PooledBuf,
+    consumed: usize,
+}
+
+impl ReceivedWindow {
+    /// bytes returns the registered bytes that no earlier [`AsyncRead`] read already consumed. The
+    /// borrow is shared so that a digest and a write can read the same window on two threads.
+    pub fn bytes(&self) -> &[u8] {
+        // Safety: the fabric task publishes a window only after every receive completion over it
+        // has been reaped, so the reader owns the registration exclusively and nothing mutates it
+        // until it is dropped.
+        unsafe { &self.buf.buffer().as_mut_slice()[self.consumed..self.buf.len()] }
+    }
+}
+
+impl std::fmt::Debug for ReceivedWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceivedWindow")
+            .field("length", &(self.buf.len() - self.consumed))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl RDMAStreamReader {
+    /// from_windows builds a reader over windows that are already "received", so tests can exercise
+    /// the consumer side without a peer.
+    pub(crate) fn from_windows(windows: Vec<PooledBuf>) -> Self {
+        let (sender, receiver) = mpsc::channel(windows.len().max(1));
+        for window in windows {
+            sender.try_send(Ok(window)).expect("test channel capacity");
+        }
+        Self::new(receiver)
+    }
 }
 
 impl AsyncRead for RDMAStreamReader {
@@ -512,4 +572,71 @@ async fn receive_stream(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdma::fabric::Fabric;
+    use tokio::io::AsyncReadExt;
+
+    /// windows fills freshly registered buffers with the given payloads.
+    async fn windows(fabric: &Fabric, payloads: &[&[u8]]) -> Vec<PooledBuf> {
+        let mut windows = Vec::new();
+        for payload in payloads {
+            let mut window = fabric.acquire_buffer(payload.len()).await.unwrap();
+            // Safety: this lease has not been posted.
+            unsafe { window.as_mut_slice() }.copy_from_slice(payload);
+            windows.push(window);
+        }
+        windows
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_window_yields_every_received_window_then_ends() {
+        let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
+        let mut reader =
+            RDMAStreamReader::from_windows(windows(&fabric, &[b"first", b"second"]).await);
+
+        let mut received = Vec::new();
+        while let Some(window) = reader.next_window().await.unwrap() {
+            received.push(window.bytes().to_vec());
+        }
+
+        assert_eq!(received, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    /// The two consumer APIs must agree on a cursor, so a window that poll_read left half-drained
+    /// hands back only its remaining bytes rather than repeating or dropping any.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_window_returns_only_the_bytes_async_read_left_behind() {
+        let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
+        let mut reader =
+            RDMAStreamReader::from_windows(windows(&fabric, &[b"abcdef", b"ghi"]).await);
+
+        let mut prefix = [0u8; 2];
+        reader.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"ab");
+
+        let mut remainder = Vec::new();
+        while let Some(window) = reader.next_window().await.unwrap() {
+            remainder.extend_from_slice(window.bytes());
+        }
+
+        assert_eq!(remainder, b"cdefghi".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_window_skips_a_window_async_read_fully_drained() {
+        let fabric = Fabric::new(None, None, 1024 * 1024, true).expect("libfabric endpoint");
+        let mut reader = RDMAStreamReader::from_windows(windows(&fabric, &[b"ab", b"cd"]).await);
+
+        let mut prefix = [0u8; 2];
+        reader.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"ab");
+
+        let window = reader.next_window().await.unwrap().expect("second window");
+        assert_eq!(window.bytes(), b"cd");
+        assert!(reader.next_window().await.unwrap().is_none());
+    }
 }
