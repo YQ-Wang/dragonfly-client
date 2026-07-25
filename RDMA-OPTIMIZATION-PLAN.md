@@ -26,7 +26,13 @@ Modelexpress commit `750239f3c0d31498c39d11694998e32d5cb2d62f` (2026-07-23).
 The prototype RFC records 64 MiB, single-EFA-domain results of 8.90 Gbps at concurrency 1 and
 45.75 Gbps at concurrency 8 with 4 MiB chunks. A 1 MiB chunk reached 48.22 Gbps at concurrency 8.
 Those results consumed the receiver into memory and are not a complete Dragonfly task benchmark.
-The temporary harness and raw results were not committed.
+
+RoCE hardware results, the harness, and its driver scripts are now committed: see
+`RDMA-ONPREM-VALIDATION.md` and `scripts/rdma-bench/`. Read that document before trusting any RDMA
+throughput number in this repository. It also records why the first round of RoCE measurements was
+invalid — the harness capped its own upload limiter at 1 GiB/s, which is 8.6 Gbps, so it measured a
+leaky bucket rather than the fabric. Any harness that constructs a limiter must take it from
+`config.upload.bandwidth_limit` the way `dfdaemon/main.rs` does, and print it.
 
 Before claiming an optimization, check in a benchmark that records:
 
@@ -98,7 +104,10 @@ hardware-provider correctness. Do not claim the strategy is fully proven until a
 - run cross-node EFA and verbs/RxM fault-injection and long-duration soak tests, including peer
   death with posted receives, CQ errors, and provider queue pressure;
 - check in complete source-read-to-target-write A/B benchmarks against the original
-  implementation, including CPU and fallback rate;
+  implementation, including CPU and fallback rate. Partially closed: cross-node verbs/RxM
+  receiver-side A/B benchmarks are committed in `RDMA-ONPREM-VALIDATION.md`, which also lists what
+  they do not cover — no TCP comparison through the same piece path, no sender-side attribution, and
+  no CPU, pinned-byte, or fallback-rate figures;
 - export the pool, queue, admission, fallback-reason, and complete-transfer timing metrics needed
   for a canary rollback decision; and
 - validate the default `maxInflightChunks` and `maxConcurrentTransfers` under representative task
@@ -150,6 +159,12 @@ duplicate source traffic materially.
   - Implemented first cut: `storage.server.rdma.mmapContent` maps finished on-disk pieces and
     fills the registered send ring from the mapping (with AsyncRead fallback for cache hits /
     map failures). Full NIC registration of mapped pages remains future work.
+  - Registering mapped content pages was evaluated and deferred, on either side of the transfer.
+    On a node that also trains, it pins page-cache pages and consumes NIC memory-region entries
+    shared with NCCL on the same device, and on NVMe-backed content it faults in blocks that are
+    about to be overwritten in full while moving durability to `msync`. See "What is left" in
+    `RDMA-ONPREM-VALIDATION.md`. Doing this needs a registration cache and a shared-device budget,
+    not a per-piece registration.
 - Consider sharing upload/download `Fabric` instances only after failure-isolation soak tests.
 - Consider one-sided RMA or `FI_HMEM` only for a future authenticated remote-key model or a
   GPU-resident cache API.

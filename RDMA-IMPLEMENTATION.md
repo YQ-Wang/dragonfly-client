@@ -254,7 +254,21 @@ storage:
 
 ## 当前性能结果
 
-在两个 EFA worker 之间传输约 26.0 GB 的 Llama-2-13B 模型：
+最新的硬件测量在 RoCE 上完成，记录于 `RDMA-ONPREM-VALIDATION.md`，harness 与驱动脚本位于
+`scripts/rdma-bench/`。引用任何 RDMA 吞吐数字之前请先读该文档。
+
+在两个 RoCE 节点之间传输 26,034,233,427 字节的 Llama-2-13B 文件布局，内容盘为内存文件系统：
+
+| 路径 | 有效并发 | 完整任务 goodput |
+|---|---:|---:|
+| 纯传输（不校验、不落盘） | 3 | 147–158 Gbps |
+| CRC32 + memfs（等价于 dfdaemon 的工作量） | 3 | 51–54 Gbps |
+| SHA-256 全量校验 + memfs | 3 | 37.7–38.1 Gbps |
+
+所有文件 SHA-256 匹配，且 `fabric_failed=false`。fabric 只占约 4 秒传输中的 18–38 ms，瓶颈完全在
+接收端 CPU：内存复制与校验，而不是线速。
+
+下面这组早期 EFA 数字仅作历史记录，**不应再被引用**：
 
 | 路径 | 并发 | 完整任务 goodput |
 |---|---:|---:|
@@ -263,10 +277,9 @@ storage:
 | mmap sender + streaming digest | 3 | 2.72 Gbps |
 | TCP tar baseline | 1 | 约 2.4 Gbps |
 
-最终测试中所有文件 SHA-256 匹配，且 `fabric_failed=false`。
-
-这些数字是完整的 source-read-to-target-write 测量，不是纯 fabric benchmark。当前瓶颈仍主要在
-CPU、内存复制、校验和存储路径，而不是 EFA 线速。
+它们是磁盘落盘的测量，且取自接收路径重写之前，所以"RDMA 只比 TCP 快一点"这个结论并不成立：同一
+工作负载在内存文件系统上已达到 51–54 Gbps。另外 `TCP tar baseline` 也不是 dfdaemon TCP piece
+路径的对照，因此这张表无法回答"RDMA 比 TCP 快多少"。要重新引用 EFA 结果，需要用当前 harness 重测。
 
 ## 尚未实现
 
@@ -274,7 +287,8 @@ CPU、内存复制、校验和存储路径，而不是 EFA 线速。
 - completion 的窗口级批量等待；
 - multi-rail 和 piece-level rail 分配；
 - NUMA-local buffer allocation 和 progress thread 绑定；
-- mmap 页面直接注册；
+- mmap 页面直接注册（已评估并暂缓：在同时跑训练的节点上会 pin page cache 并占用与 NCCL 共享的
+  NIC memory region，NVMe 上还会读入即将被整块覆盖的页；见 `RDMA-ONPREM-VALIDATION.md`）；
 - rendezvous 连接复用；
 - RDMA-aware parent scheduling 和跨 Parent retry；
 - one-sided RMA；
