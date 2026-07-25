@@ -446,12 +446,15 @@ impl Content {
     #[instrument(skip_all)]
     pub async fn write_piece_from_rdma_stream(
         &self,
+        piece_id: &str,
         task_id: &str,
         offset: u64,
         expected_length: u64,
         reader: &mut crate::client::rdma::RDMAStreamReader,
+        window_timeout: std::time::Duration,
     ) -> Result<super::content::WritePieceResponse> {
         use std::os::unix::fs::FileExt;
+        use tokio::time::timeout;
 
         let task_path = self.get_task_path(task_id);
 
@@ -475,7 +478,20 @@ impl Content {
 
         let mut hasher = crc32fast::Hasher::new();
         let mut length = 0u64;
-        while let Some(window) = reader.next_window().await? {
+        loop {
+            // Only the wait for the next window is bounded, and the caller must not wrap this loop
+            // in a cancelling timeout either. The digest and the pwrite below run on blocking
+            // threads that cannot be aborted, so abandoning them between spawn and join would
+            // leave a write outstanding while the caller falls back to TCP and rewrites the same
+            // range, and the late write would then contradict the digest recorded for the piece.
+            let window = match timeout(window_timeout, reader.next_window()).await {
+                Ok(window) => window?,
+                Err(_) => return Err(Error::DownloadPieceFinishedTimeout(piece_id.to_string())),
+            };
+            let Some(window) = window else {
+                break;
+            };
+
             let window_length = window.bytes().len() as u64;
 
             // Bound the write like write_piece's `take` does: a parent that streams more than the
@@ -1157,6 +1173,11 @@ mod tests {
         assert!(!response.hash.is_empty());
     }
 
+    /// TEST_WINDOW_TIMEOUT is generous because these windows are already queued; the tests are
+    /// about the length and digest checks, not about the wait.
+    #[cfg(feature = "rdma")]
+    const TEST_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// rdma_stream_reader hands the content layer windows that are already "received".
     #[cfg(feature = "rdma")]
     async fn rdma_stream_reader(payloads: &[&[u8]]) -> crate::client::rdma::RDMAStreamReader {
@@ -1186,7 +1207,7 @@ mod tests {
 
         let mut reader = rdma_stream_reader(&[b"rdma", b"-win"]).await;
         let response = content
-            .write_piece_from_rdma_stream(task_id, 1, 8, &mut reader)
+            .write_piece_from_rdma_stream("piece", task_id, 1, 8, &mut reader, TEST_WINDOW_TIMEOUT)
             .await
             .unwrap();
 
@@ -1218,7 +1239,7 @@ mod tests {
 
         let mut reader = rdma_stream_reader(&[b"0123", b"4567"]).await;
         let Err(err) = content
-            .write_piece_from_rdma_stream(task_id, 0, 6, &mut reader)
+            .write_piece_from_rdma_stream("piece", task_id, 0, 6, &mut reader, TEST_WINDOW_TIMEOUT)
             .await
         else {
             panic!("stream longer than the piece must fail");
@@ -1248,7 +1269,7 @@ mod tests {
 
         let mut reader = rdma_stream_reader(&[b"0123"]).await;
         let Err(err) = content
-            .write_piece_from_rdma_stream(task_id, 0, 8, &mut reader)
+            .write_piece_from_rdma_stream("piece", task_id, 0, 8, &mut reader, TEST_WINDOW_TIMEOUT)
             .await
         else {
             panic!("stream shorter than the piece must fail");

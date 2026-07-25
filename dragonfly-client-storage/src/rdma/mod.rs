@@ -28,7 +28,14 @@
 //!   with mandatory per-piece TCP fallback ([`rendezvous`]).
 //!
 //! The [`fabric`] module (and the client/server built on it) requires libfabric at build
-//! time and is gated behind the `rdma` cargo feature.
+//! time and is gated behind the `rdma` cargo feature. That feature is Linux-only; [`rendezvous`]
+//! is plain TCP and builds everywhere so the capability handshake can be tested on any host.
+
+#[cfg(all(feature = "rdma", not(target_os = "linux")))]
+compile_error!(
+    "the rdma feature is only supported on linux: it needs libfabric and the registered-memory \
+     write path in content_linux.rs"
+);
 
 pub mod rendezvous;
 

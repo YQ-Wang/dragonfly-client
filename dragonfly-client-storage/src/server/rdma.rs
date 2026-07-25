@@ -350,11 +350,7 @@ impl RDMAServerHandler {
                     "rdma piece transfer timed out after {:?}",
                     self.piece_timeout
                 );
-                let _ = time::timeout(
-                    self.transfer_timeout,
-                    self.abort(&mut writer, ERROR_CODE_INTERNAL, message),
-                )
-                .await;
+                let _ = self.abort(&mut writer, ERROR_CODE_INTERNAL, message).await;
                 Err(err.into())
             }
         }
@@ -732,7 +728,14 @@ impl RDMAServerHandler {
         message: String,
     ) -> ClientResult<()> {
         error!("aborting rdma transfer: {}", message);
-        write_frame(writer, &Frame::Error(RendezvousError { code, message })).await
+        // The write is bounded here rather than at each call site: a peer that stops reading holds
+        // this connection's admission permit for as long as the write blocks, and a permit held
+        // that way is never returned, so enough such peers switch RDMA serving off entirely.
+        time::timeout(
+            self.transfer_timeout,
+            write_frame(writer, &Frame::Error(RendezvousError { code, message })),
+        )
+        .await?
     }
 }
 

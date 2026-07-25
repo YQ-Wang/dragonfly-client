@@ -102,8 +102,9 @@ impl ReceivedWindow {
     pub fn bytes(&self) -> &[u8] {
         // Safety: the fabric task publishes a window only after every receive completion over it
         // has been reaped, so the reader owns the registration exclusively and nothing mutates it
-        // until it is dropped.
-        unsafe { &self.buf.buffer().as_mut_slice()[self.consumed..self.buf.len()] }
+        // until it is dropped. The read-only accessor keeps two concurrent callers from each
+        // creating a mutable borrow over the same bytes.
+        unsafe { &self.buf.as_slice()[self.consumed..] }
     }
 }
 

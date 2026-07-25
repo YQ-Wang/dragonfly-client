@@ -842,9 +842,13 @@ impl Storage {
 
     /// download_piece_from_parent_finished_rdma writes an RDMA stream directly from registered
     /// receive windows into content storage without an AsyncRead bounce buffer.
-    #[cfg(all(feature = "rdma", target_os = "linux"))]
+    #[cfg(feature = "rdma")]
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all)]
+    /// `timeout` bounds the wait for each receive window rather than the whole write. The write
+    /// loop must not be cancelled part way: it hands each window to blocking threads that cannot
+    /// be aborted, and a write abandoned there could land after the caller has fallen back to TCP
+    /// and rewritten the same range.
     pub async fn download_piece_from_parent_finished_rdma(
         &self,
         piece_id: &str,
@@ -856,30 +860,9 @@ impl Storage {
         reader: &mut crate::client::rdma::RDMAStreamReader,
         timeout: Duration,
     ) -> Result<metadata::Piece> {
-        tokio::select! {
-            piece = self.handle_downloaded_piece_from_parent_finished_rdma(
-                piece_id, task_id, offset, length, expected_digest, parent_id, reader
-            ) => piece,
-            _ = sleep(timeout) => Err(Error::DownloadPieceFinishedTimeout(piece_id.to_string())),
-        }
-    }
-
-    #[cfg(all(feature = "rdma", target_os = "linux"))]
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all)]
-    async fn handle_downloaded_piece_from_parent_finished_rdma(
-        &self,
-        piece_id: &str,
-        task_id: &str,
-        offset: u64,
-        length: u64,
-        expected_digest: &str,
-        parent_id: &str,
-        reader: &mut crate::client::rdma::RDMAStreamReader,
-    ) -> Result<metadata::Piece> {
         let response = self
             .content
-            .write_piece_from_rdma_stream(task_id, offset, length, reader)
+            .write_piece_from_rdma_stream(piece_id, task_id, offset, length, reader, timeout)
             .await?;
         self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)
     }

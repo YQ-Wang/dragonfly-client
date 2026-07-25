@@ -188,6 +188,11 @@ struct CtxBlock([u8; 128]);
 
 /// PendingOp tracks one posted operation until its completion arrives.
 struct PendingOp {
+    /// id distinguishes this operation from a later one that reuses its context address. The
+    /// allocator is free to hand the same block to the next post once a completion is reaped,
+    /// so the address alone cannot identify an operation.
+    id: u64,
+
     /// tx delivers the completion to the waiting task.
     tx: oneshot::Sender<Completion>,
 
@@ -283,6 +288,10 @@ struct FabricInner {
     /// pending maps context addresses to in-flight operations.
     pending: Mutex<HashMap<usize, PendingOp>>,
 
+    /// op_counter issues the identifiers that tell a live operation apart from a completed one
+    /// whose context address has been reused.
+    op_counter: AtomicU64,
+
     /// av maps peer endpoint addresses to fabric addresses (fi_addr_t).
     av: Mutex<HashMap<Vec<u8>, u64>>,
 
@@ -352,13 +361,13 @@ impl FabricInner {
     }
 
     /// cancel_ctx attempts to cancel an operation that is still tracked. CQ progress cannot
-    /// remove and free the context between this lookup and fi_cancel.
-    fn cancel_ctx(&self, ctx_addr: usize) {
+    /// remove and free the context between this lookup and fi_cancel. `id` is checked because a
+    /// completion may already have been reaped and the context address handed to a different
+    /// operation, which must not be cancelled in this one's place.
+    fn cancel_ctx(&self, ctx_addr: usize, id: u64) {
         let cancel_error = {
             let _progress_guard = self.cancel_progress_lock.lock().unwrap();
-            if self.failed.load(Ordering::Acquire)
-                || !self.pending.lock().unwrap().contains_key(&ctx_addr)
-            {
+            if self.failed.load(Ordering::Acquire) || !self.is_pending(ctx_addr, id) {
                 None
             } else {
                 let _lifecycle = self.handle.endpoint_lifecycle.read().unwrap();
@@ -378,6 +387,16 @@ impl FabricInner {
         if let Some(rc) = cancel_error {
             self.fail_and_abort(format!("rdma operation cancellation failed: {}", rc));
         }
+    }
+
+    /// is_pending reports whether the operation identified by both its context address and its id
+    /// is still in flight.
+    fn is_pending(&self, ctx_addr: usize, id: u64) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(&ctx_addr)
+            .is_some_and(|op| op.id == id)
     }
 }
 
@@ -472,6 +491,18 @@ impl PinnedBuf {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_mut_slice(&self) -> &mut [u8] {
         (*self.data.get()).as_mut_slice()
+    }
+
+    /// as_slice exposes the buffer for reading. Readers must use this rather than
+    /// [`PinnedBuf::as_mut_slice`]: two concurrent readers of one buffer would otherwise each
+    /// materialize a `&mut [u8]` over the same bytes, which aliases.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no operation over this buffer is currently posted and that
+    /// nothing mutates it while the returned slice lives.
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        (*self.data.get()).as_slice()
     }
 
     /// as_mut_range exposes one mutable subrange for pipelined filling.
@@ -654,6 +685,16 @@ impl PooledBuf {
         &mut self.buffer().as_mut_slice()[..self.logical_len]
     }
 
+    /// as_slice exposes only the transfer-visible prefix for reading, and may be called
+    /// concurrently for the same lease.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no operation over this buffer is currently posted.
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        &self.buffer().as_slice()[..self.logical_len]
+    }
+
     /// as_mut_range exposes one transfer-visible subrange for pipelined filling.
     ///
     /// # Safety
@@ -719,7 +760,7 @@ impl AsyncRead for PooledBufReader {
         let end = start + read_len;
         // Safety: PooledBufReader is constructed only after every receive completion was
         // reaped, and it exclusively owns the lease while exposing this range.
-        let content = unsafe { &self.buffer.as_mut_slice()[start..end] };
+        let content = unsafe { &self.buffer.as_slice()[start..end] };
         output.put_slice(content);
         self.position = end;
         Poll::Ready(Ok(()))
@@ -730,6 +771,10 @@ impl AsyncRead for PooledBufReader {
 pub struct OpHandle {
     /// ctx_addr identifies the operation in the pending map (and to fi_cancel).
     ctx_addr: usize,
+
+    /// id pairs with ctx_addr so a handle dropped after its completion was reaped cannot cancel
+    /// whichever operation has since been given the same context address.
+    id: u64,
 
     /// rx receives the completion from the progress thread.
     rx: Option<oneshot::Receiver<Completion>>,
@@ -746,7 +791,7 @@ impl OpHandle {
     /// cancel requests cancellation while leaving the pending entry responsible for the context
     /// and buffer until the provider reports a completion.
     fn cancel(&self) {
-        self.inner.cancel_ctx(self.ctx_addr);
+        self.inner.cancel_ctx(self.ctx_addr, self.id);
     }
 }
 
@@ -886,6 +931,7 @@ impl Fabric {
             cancel_progress_lock: Mutex::new(()),
             handle,
             pending: Mutex::new(HashMap::new()),
+            op_counter: AtomicU64::new(0),
             av: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -1224,6 +1270,7 @@ impl Fabric {
 
         let ctx = Box::new(CtxBlock([0u8; 128]));
         let ctx_addr = &*ctx as *const CtxBlock as usize;
+        let id = self.inner.op_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
 
         // Register the pending operation before posting so a completion arriving
@@ -1231,6 +1278,7 @@ impl Fabric {
         self.inner.pending.lock().unwrap().insert(
             ctx_addr,
             PendingOp {
+                id,
                 tx,
                 _ctx: ctx,
                 _buf: buf.clone(),
@@ -1279,6 +1327,7 @@ impl Fabric {
                 0 => {
                     return Ok(OpHandle {
                         ctx_addr,
+                        id,
                         rx: Some(rx),
                         inner: self.inner.clone(),
                         armed: true,
@@ -1311,6 +1360,7 @@ impl Fabric {
     /// grace period, the buffer is left pinned (leaked) rather than freed under the NIC.
     pub async fn wait(&self, mut op: OpHandle, timeout: Duration) -> Result<usize> {
         let ctx_addr = op.ctx_addr;
+        let op_id = op.id;
         let rx = op.rx.take().expect("rdma operation receiver");
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(completion)) if completion.err == 0 => {
@@ -1332,7 +1382,7 @@ impl Fabric {
                 // and its buffer reference are released.
                 let deadline = tokio::time::Instant::now() + CANCEL_GRACE_TIMEOUT;
                 loop {
-                    if !self.inner.pending.lock().unwrap().contains_key(&ctx_addr) {
+                    if !self.inner.is_pending(ctx_addr, op_id) {
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {
