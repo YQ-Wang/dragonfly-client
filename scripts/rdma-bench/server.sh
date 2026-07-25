@@ -19,6 +19,7 @@ kubectl exec "$SRV_POD" -- sh -c "
     --provider ${PROVIDER} --device ${DEVICE} --fabric-tag ${FABRIC_TAG} \
     --bind 0.0.0.0 --tcp-port ${TCP_PORT} --rdma-port ${RDMA_PORT} \
     --chunk-mib ${CHUNK_MIB} --max-inflight ${MAX_INFLIGHT} \
+    --max-registered-mib ${MAX_REGISTERED_MIB} \
     --files-dir ${FILES_DIR} --data-dir ${DATA_DIR} \
     > ${BENCH_DIR}/server.log 2>&1 < /dev/null &
   echo started

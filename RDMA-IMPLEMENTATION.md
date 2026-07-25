@@ -321,20 +321,47 @@ storage:
 
 它们是磁盘落盘的测量，且取自接收路径重写之前，所以"RDMA 只比 TCP 快一点"这个结论并不成立：同一
 工作负载在内存文件系统上已达到 51–54 Gbps。另外 `TCP tar baseline` 也不是 dfdaemon TCP piece
-路径的对照，因此这张表无法回答"RDMA 比 TCP 快多少"。要重新引用 EFA 结果，需要用当前 harness 重测。
+路径的对照，因此这张表无法回答"RDMA 比 TCP 快多少"。用当前 harness 重测的 EFA 结果见
+[与 TCP 的对照](#与-tcp-的对照)。
 
 ### 与 TCP 的对照
 
 harness 现在支持 `--transport tcp`：同一批 piece、同一个 Parent、同样的 digest 与 sink，只是改从
 Vortex TCP piece server 取数据。`scripts/rdma-bench/compare.sh` 在一组并发下交替跑两种传输并列出
-对比。硬件对照数据尚未采集（EFA 节点当前因 GPU 容量不足无法调度），进展记录在
-`RDMA-ONPREM-VALIDATION.md`。
+对比。
+
+硬件对照在两台 `p6-b200.48xlarge` EFA 节点上完成，使用八张 EFA 中的一张（`rdmap79s0-rdm`），
+数据集为 48 × 512 MiB 文件（24 GiB，每个文件一个 piece），4 MiB chunk、16 chunk in-flight
+（即 64 MiB window），每个点取三次中的最好成绩。完整记录见 `RDMA-ONPREM-VALIDATION.md`。
+
+| 并发 | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| 纯传输 RDMA | 46.98 | 84.58 | 139.51 | 218.51 | 279.63 | 279.44 |
+| 纯传输 TCP | 3.96 | 7.95 | 14.64 | 27.89 | 49.56 | 70.59 |
+| CRC32 + 落盘 RDMA | 21.48 | 36.41 | 69.65 | 116.01 | 143.27 | 125.08 |
+| CRC32 + 落盘 TCP | 3.30 | 6.64 | 12.58 | 23.41 | 45.10 | 63.53 |
+
+单位为 Gbps。在 dfdaemon 实际的工作量（CRC32 + 落盘）下，低并发约 6.5×，到 32 并发收窄到约 2×；
+只测传输则是 4–12×。所以"RDMA 比 TCP 快多少"只能给区间，不能给单一数字。
+
+差距收窄来自两头：TCP piece server 每个并发 piece 用一条连接，而这张网络单条 TCP flow 只有约
+5 Gbps（裸 socket 实测 1/4/16/32 条流分别为 4.96/19.83/74.11/135.57 Gbps），所以并发越高 TCP 越
+接近网络本身的能力；而 RDMA 在纯传输约 280 Gbps、CRC32 + 落盘约 143 Gbps 处饱和，16 并发之后
+CRC32 那一列反而回落（32 并发 125 Gbps），瓶颈是接收端 CPU 而不是 fabric。这与 RoCE 上的结论一致。
+
+需要记录的反面结果：**接收侧流水线在这套硬件上没有可测收益。** depth 1 与 depth 2 的 A/B 在
+4 MiB 和 1 MiB chunk、1 和 4 并发下差异都落在重复运行的波动范围内，包括本来预期收益最明显的小
+chunk。原因是每条流的 fabric 吞吐稳定在 50–54 Gbps，受发送端 staging copy 限制，而不是被
+control-plane 往返卡住——RoCE 在该流水线存在之前测到的也是同一个 ~53 Gbps。同理，512 MiB 默认
+注册预算会让两个并发传输退化成 depth 1，实测同样没有代价（16/32 并发下预算连每个传输一个 window
+都给不满，goodput 仍然持平）。
 
 ## 尚未实现
 
 - batch post 和 reusable context slab；
 - completion 的窗口级批量等待；
-- 接收流水线深度可配置（当前固定为 2 个窗口）；
+- 接收流水线深度可配置（当前固定为 2 个窗口；EFA 上实测 depth 1/2 无差别，在发送端 staging copy
+  之前做成配置项没有意义）；
 - multi-rail 和 piece-level rail 分配；
 - NUMA-local buffer allocation 和 progress thread 绑定；
 - mmap 页面直接注册（已评估并暂缓：在同时跑训练的节点上会 pin page cache 并占用与 NCCL 共享的

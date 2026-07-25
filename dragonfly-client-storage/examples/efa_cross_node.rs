@@ -97,6 +97,7 @@ struct Args {
     fabric_tag: String,
     chunk_mib: u64,
     max_inflight: u32,
+    max_registered_mib: u64,
     concurrency: usize,
     digest: DigestAlgorithm,
     sink: Sink,
@@ -118,6 +119,10 @@ fn parse_args() -> Args {
         fabric_tag: "roce-test".into(),
         chunk_mib: 4,
         max_inflight: 16,
+        // Far above the dfdaemon default, so a measurement is not silently capped by the
+        // registration budget unless it is asked to be. Pass --max-registered-mib 512 to
+        // reproduce what the default budget does to the receive pipeline.
+        max_registered_mib: 64 * 1024,
         concurrency: 2,
         digest: DigestAlgorithm::Sha256,
         sink: Sink::Pwrite,
@@ -139,6 +144,7 @@ fn parse_args() -> Args {
             "--fabric-tag" => args.fabric_tag = it.next().expect("--fabric-tag"),
             "--chunk-mib" => args.chunk_mib = it.next().unwrap().parse().unwrap(),
             "--max-inflight" => args.max_inflight = it.next().unwrap().parse().unwrap(),
+            "--max-registered-mib" => args.max_registered_mib = it.next().unwrap().parse().unwrap(),
             "--concurrency" => args.concurrency = it.next().unwrap().parse().unwrap(),
             "--digest" => args.digest = DigestAlgorithm::parse(&it.next().expect("--digest")),
             "--sink" => args.sink = Sink::parse(&it.next().expect("--sink")),
@@ -172,7 +178,7 @@ fn make_config(args: &Args) -> Config {
     config.storage.server.rdma.fabric_tag = Some(args.fabric_tag.clone());
     config.storage.server.rdma.chunk_size = ByteSize::mib(args.chunk_mib);
     config.storage.server.rdma.max_inflight_chunks = args.max_inflight;
-    config.storage.server.rdma.max_registered_bytes = ByteSize::gib(64);
+    config.storage.server.rdma.max_registered_bytes = ByteSize::mib(args.max_registered_mib);
     config.storage.server.rdma.max_concurrent_transfers = 64;
     config.storage.server.rdma.transfer_timeout = Duration::from_secs(900);
     config.storage.server.rdma.mmap_content = true;

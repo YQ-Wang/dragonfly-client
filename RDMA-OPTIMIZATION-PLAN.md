@@ -1,6 +1,6 @@
 # RDMA P2P Optimization Plan
 
-> Work currently in flight, and the one measurement still missing, are tracked in `RDMA-WIP.md`.
+> Measured results, including RDMA against the TCP piece server, are in `RDMA-ONPREM-VALIDATION.md`.
 
 ## Goal
 

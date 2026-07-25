@@ -24,5 +24,10 @@ RDMA_PORT=${RDMA_PORT:-4007}
 CHUNK_MIB=${CHUNK_MIB:-4}
 MAX_INFLIGHT=${MAX_INFLIGHT:-16}
 
+# Registered-memory budget. Well above the dfdaemon default of 512 MiB so that a run measures the
+# transport rather than the budget; set it to 512 to measure what the default does to the receive
+# pipeline, which needs 4 windows (2 posted plus a depth-2 channel) per concurrent transfer.
+MAX_REGISTERED_MIB=${MAX_REGISTERED_MIB:-65536}
+
 BENCH_DIR=${BENCH_DIR:-/bench}
 MEMFS=${MEMFS:-/mnt/memfs}

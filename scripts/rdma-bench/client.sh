@@ -30,6 +30,7 @@ kubectl exec "$CLI_POD" -- sh -c "
     --parent-host ${SRV_IP} --tcp-port ${TCP_PORT} --rdma-port ${RDMA_PORT} \
     --transport ${TRANSPORT} \
     --concurrency ${CONCURRENCY} --chunk-mib ${CHUNK_MIB} --max-inflight ${MAX_INFLIGHT} \
+    --max-registered-mib ${MAX_REGISTERED_MIB} \
     --digest ${DIGEST} --sink ${SINK} \
     --out-dir ${OUT_DIR} --data-dir ${DATA_DIR} 2>&1 \
   | grep -E 'OK piece|MODEL_TRANSFER_DONE|MODEL_TRANSFER_COST|discovered|panic|error'
